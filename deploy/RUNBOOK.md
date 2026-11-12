@@ -85,7 +85,9 @@ hermes-test-serve.service:
 
 Stdlib + `websockets`, no privileged access, no writes. Run it inside the
 checkout's environment so the WebSocket library comes from the same env the
-server uses:
+server uses. The `cd` below is load-bearing: `run-in-hermes-env` composes the
+environment for the *current* checkout, so invoking it by absolute path from
+any other cwd fails with "the 'websockets' package is required":
 
 ```bash
 cd /home/claude/.hermes/hermes-agent-test
