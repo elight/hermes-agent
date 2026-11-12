@@ -52,7 +52,6 @@ import http.cookiejar
 import json
 import os
 import ssl
-import statistics
 import sys
 import time
 import urllib.error
@@ -427,10 +426,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("ticket", help="mint a ws ticket and report elapsed ms")
-    sub.add_parser("open", help="open /api/ws on a fresh ticket and report elapsed ms")
+    def sub_json(p: argparse.ArgumentParser) -> None:
+        # The documented position is AFTER the subcommand (RUNBOOK.md and the C1
+        # contract: 'phases --cycles 20 --json'). default=SUPPRESS: when the flag
+        # is absent the subparser writes nothing to the namespace, so a top-level
+        # '--json phases' still works; either position sets args.json.
+        p.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                       help="machine-readable output")
+
+    ticket = sub.add_parser("ticket", help="mint a ws ticket and report elapsed ms")
+    sub_json(ticket)
+    open_ = sub.add_parser("open", help="open /api/ws on a fresh ticket and report elapsed ms")
+    sub_json(open_)
     phases = sub.add_parser("phases", help="run the reconnect sequence and print the phase table")
     phases.add_argument("--cycles", type=int, default=20, help="reconnect cycles (default 20)")
+    sub_json(phases)
     return parser
 
 
