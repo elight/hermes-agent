@@ -2676,7 +2676,15 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
 def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
     """The profile owner executes; this subprocess only waits for its receipt."""
     import sys
-    return [sys.executable, "-m", "hermes_cli.kanban_worker_client"]
+    # ``-P`` (safe path) is the load-bearing flag: without it ``-m`` prepends the child's
+    # cwd — the task workspace — ahead of the PYTHONPATH pin below, and a worktree
+    # workspace of the Hermes checkout shadows the launcher's own tree. The child then
+    # boots the WORKTREE's hermes_bootstrap: a fresh project root whose install has no
+    # committed dependency environment, so a PM store interpreter dies at
+    # ``pm/environments.py`` before the claim is ever submitted (every dispatcher worktree
+    # spawn crashed exactly this way). The pin is the whole import contract;
+    # ``harden_import_path`` drops the same cwd entry for the modules that follow.
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
 
 
 def _open_worker_log(task: Task, board: Optional[str]):
