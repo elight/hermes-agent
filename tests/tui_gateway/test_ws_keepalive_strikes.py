@@ -23,10 +23,12 @@ import socket
 import threading
 import time
 
+import pytest
 import uvicorn
 from fastapi import FastAPI, WebSocket
 
 from hermes_cli.web_server_keepalive import (
+    _sansio_strike_base,
     strike_keepalive_protocol,
     ws_ping_strikes,
 )
@@ -280,9 +282,84 @@ def test_single_cycle_cadences_keep_the_transports_own_arithmetic():
     assert strike_keepalive_protocol((None, None)) == "auto"
     assert strike_keepalive_protocol((60.0, 600.0)) == "auto"
     extended = strike_keepalive_protocol((20.0, 20.0))
-    from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
-    assert issubclass(extended, WebSocketsSansIOProtocol)
     assert strike_keepalive_protocol((20.0, 20.0)) is extended  # one class per strike count
+    base = _sansio_strike_base()
+    if base is None:  # the pyproject floor's uvicorn has no sansio keepalive to extend
+        assert extended == "auto"  # the fallback tests below pin WHY, and that detection survives
+    else:
+        assert issubclass(extended, base)
+
+
+def test_the_strike_class_extends_the_transport_uvicorn_actually_runs():
+    """The policy is an override of the sansio keepalive hooks, so it is only sound while
+    ``ws="auto"`` resolves to that same class. Subclassing anything else would swap the
+    listener's transport rather than tune it."""
+    from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+
+    protocol = strike_keepalive_protocol((20.0, 20.0))
+    if protocol == "auto":
+        pytest.skip("this uvicorn's auto transport has no sansio keepalive to extend "
+                    "(the pyproject floor); the fallback test below pins that verdict")
+    assert AutoWebSocketsProtocol in protocol.__mro__
+
+
+def test_a_transport_without_sansio_keepalive_keeps_its_own_ping_verdict(caplog):
+    """The pyproject floor (``uvicorn>=0.31``) predates the sansio keepalive. On 0.41 ``ws="auto"``
+    resolves to the LEGACY ``websockets_impl.WebSocketProtocol`` (whose own ping does the killing)
+    and the sansio class carries no keepalive at all, so subclassing the sansio class silently
+    turned half-open detection OFF — the reviewer measured a never-ponging peer left alive with 0
+    pings sent where ``auto`` killed it. Both shapes of that uvicorn must fall back to ``"auto"``.
+
+    Each arm runs on a cold protocol cache: the class cache is the process's answer to "what does
+    this uvicorn give us", so a warm entry would return the verdict of an earlier arm. And the
+    fallback must SAY SO — one WARNING naming the uvicorn version, not a silent downgrade.
+    """
+    import uvicorn.protocols.websockets.auto as auto_mod
+    import uvicorn.protocols.websockets.websockets_sansio_impl as sansio_mod
+    from hermes_cli import web_server_keepalive as keepalive
+    from uvicorn.protocols.websockets.websockets_impl import WebSocketProtocol as _Legacy
+
+    class _SansioPreKeepalive:  # what the sansio class looked like before its ping existed
+        pass
+
+    # Arm 1: auto resolves to the legacy transport (uvicorn before the sansio switch).
+    with _cold_strike_cache(keepalive), _fresh_fallback_warning(keepalive), \
+            caplog.at_level(logging.WARNING, logger="hermes_cli.web_server_keepalive"):
+        with _swapped(auto_mod, "AutoWebSocketsProtocol", _Legacy):
+            assert strike_keepalive_protocol((20.0, 20.0)) == "auto"
+        # Arm 2: auto IS sansio, but that sansio has no keepalive hooks to override (the floor).
+        with _swapped(sansio_mod, "WebSocketsSansIOProtocol", _SansioPreKeepalive), \
+                _swapped(auto_mod, "AutoWebSocketsProtocol", _SansioPreKeepalive):
+            assert strike_keepalive_protocol((20.0, 20.0)) == "auto"
+        # Warn-once: one static verdict per uvicorn install, not one per listener build.
+        warnings = [r for r in caplog.records
+                    if r.levelno == logging.WARNING and "no sansio keepalive" in r.getMessage()]
+        assert len(warnings) == 1, [r.getMessage() for r in caplog.records]
+        assert uvicorn.__version__ in warnings[0].getMessage()
+
+
+@contextlib.contextmanager
+def _cold_strike_cache(keepalive_module):
+    """Empty the per-process strike-class cache for the duration of the block."""
+    with _swapped(keepalive_module, "_STRIKE_PROTOCOLS", {}):
+        yield
+
+
+@contextlib.contextmanager
+def _fresh_fallback_warning(keepalive_module):
+    """Clear the warn-once latch so this arm sees the warning a cold process would emit."""
+    with _swapped(keepalive_module, "_no_base_fallback_logged", False):
+        yield
+
+
+@contextlib.contextmanager
+def _swapped(module, name, value):
+    original = getattr(module, name)
+    setattr(module, name, value)
+    try:
+        yield
+    finally:
+        setattr(module, name, original)
 
 
 def test_strike_policy_does_not_disturb_a_healthy_client():

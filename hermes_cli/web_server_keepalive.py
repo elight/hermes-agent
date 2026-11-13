@@ -13,10 +13,18 @@ budget still fits under the proxy idle cap the non-loopback bind sits behind (do
 Cloudflare Tunnel ~100 s). Half-open detection must stay inside that cap; where one longer
 cycle already owns the budget (the SSH-tunnel path's 60/600), the policy leaves the transport's
 own single-strike arithmetic alone.
+
+The policy is an override of the sansio keepalive, so it applies only while uvicorn's own
+``ws="auto"`` transport is a sansio that HAS that keepalive: on older uvicorn (the dependency
+floor) there is nothing to extend, and the listener keeps uvicorn's transport untouched rather
+than a subclass whose ping never fires.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
+
+_log = logging.getLogger(__name__)
 
 #: Non-loopback binds sit behind proxies that drop idle connections at roughly this idle time;
 #: a genuinely half-open connection must be detected before the proxy does.
@@ -82,17 +90,50 @@ def _make_strike_protocol(base: type, strikes: int) -> type:
 
 _STRIKE_PROTOCOLS: dict[int, type[Any]] = {}
 
+#: The three hooks ``_make_strike_protocol`` overrides. They arrived together with the sansio
+#: keepalive, so their presence is the capability probe — no version table to keep current.
+_KEEPALIVE_HOOKS = ("send_keepalive_ping", "keepalive_timeout", "handle_pong")
+
+#: Warn-once latch for the fallback below: every listener build would otherwise repeat one
+#: static verdict about this uvicorn install.
+_no_base_fallback_logged = False
+
+
+def _sansio_strike_base() -> Optional[Any]:
+    """The transport the strike policy may extend, or ``None`` when this uvicorn has none.
+
+    The base is uvicorn's OWN ``ws="auto"`` class, and only while that class carries the
+    keepalive hooks the policy overrides. Both halves matter: subclassing a class uvicorn would
+    not have run swaps the listener's transport, and subclassing a sansio that predates the
+    keepalive (the ``pyproject`` floor's 0.41: ``auto`` resolves to the LEGACY
+    ``websockets_impl.WebSocketProtocol``, whose own ping does the killing, and the sansio class
+    has no ping at all) produced a transport that never pings — half-open detection silently
+    OFF. ``None`` makes the callers hand uvicorn ``"auto"``, i.e. that uvicorn's own behavior,
+    single-strike and intact.
+
+    ``Any``, not ``type``: uvicorn annotates the ``auto`` alias as a callable, and the class it
+    resolves to at import time is what we subclass.
+    """
+    try:
+        from uvicorn.protocols.websockets.auto import AutoWebSocketsProtocol
+    except ImportError:  # pragma: no cover -- a uvicorn build without websocket protocols
+        return None
+    if not all(callable(getattr(AutoWebSocketsProtocol, hook, None)) for hook in _KEEPALIVE_HOOKS):
+        return None
+    return AutoWebSocketsProtocol
+
 
 def strike_keepalive_protocol(ws_ping: tuple[Optional[float], Optional[float]]) -> Any:
     """The ``uvicorn.Config(ws=...)`` value for a listener with cadence *ws_ping* (interval, timeout);
     ``"auto"`` keeps the transport untouched.
 
     "auto" means "no change to the transport": pings off, a single-strike policy (identical to
-    upstream), or a uvicorn whose auto transport is not the sansio implementation we can extend
-    (no ``websockets`` package installed → uvicorn falls back to wsproto, whose keepalive is
-    different code and keeps the old behavior). Returns ``Any`` because the value IS the
-    ``WebSocketsSansIOProtocol`` subclass at runtime; uvicorn's own annotation wants
-    ``type[Protocol]``, which a dynamic ``class X(base)`` is not statically.
+    upstream), or a uvicorn whose auto-resolved transport has no sansio keepalive to extend
+    (the pyproject floor, or no ``websockets`` package installed → uvicorn falls back to wsproto,
+    whose keepalive is different code) — in every one of those the transport uvicorn picks keeps
+    its own detection working. Returns ``Any`` because the value IS the sansio subclass at
+    runtime; uvicorn's own annotation wants ``type[Protocol]``, which a dynamic ``class X(base)``
+    is not statically.
     """
     strikes = ws_ping_strikes(ws_ping[0], ws_ping[1])
     if strikes <= 1:
@@ -100,10 +141,19 @@ def strike_keepalive_protocol(ws_ping: tuple[Optional[float], Optional[float]]) 
     cached = _STRIKE_PROTOCOLS.get(strikes)
     if cached is not None:
         return cached
-    try:
-        from uvicorn.protocols.websockets.websockets_sansio_impl import WebSocketsSansIOProtocol
-    except ImportError:  # pragma: no cover -- the wsproto fallback keeps the cadence as-is
+    base = _sansio_strike_base()
+    if base is None:
+        global _no_base_fallback_logged
+        if not _no_base_fallback_logged:
+            _no_base_fallback_logged = True
+            import uvicorn  # hard dependency; its version names which floor we are on
+
+            _log.warning(
+                "uvicorn %s has no sansio keepalive to extend, so the two-strike tolerance is "
+                "not applied to non-loopback listeners: a suspended peer still fails after ONE "
+                "missed pong (half-open detection itself is unchanged — uvicorn's own transport "
+                "runs). Upgrade uvicorn to get the rescue band.", uvicorn.__version__)
         return "auto"
-    protocol = _make_strike_protocol(WebSocketsSansIOProtocol, strikes)
+    protocol = _make_strike_protocol(base, strikes)
     _STRIKE_PROTOCOLS[strikes] = protocol
     return protocol
