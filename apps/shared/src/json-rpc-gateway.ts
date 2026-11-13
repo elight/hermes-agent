@@ -30,12 +30,36 @@ export interface GatewayClientOptions {
   onUncorrelatedError?: JsonRpcRequestChannelOptions['onUncorrelatedError']
   /** Return true to intercept the default closed-state transition. */
   onSocketClose?: (event: { code: number }) => boolean | void
+  /**
+   * C1 reconnect telemetry (t_c1f387b2): fired once per socket generation when the post-open
+   * phases are complete (first response landed and, if this generation fetched a reconnect
+   * replay, the replay barrier released), and once more — with whatever arrived — if the
+   * generation dies before that. Observation only; nothing else reads it.
+   */
+  onSocketPhases?: (phases: GatewaySocketPhases) => void
   /** Fetch `session.events.since` after a reconnect (default). Off for notification-only feeds whose peer never answers RPCs. */
   replay?: boolean
   requestIdPrefix?: string
   requestTimeoutMs?: number
   socketFactory?: (url: string) => WebSocketLike
   notConnectedErrorMessage?: string
+}
+
+/**
+ * Durations for one socket generation — the same column names as the C1 phase contract
+ * (`deploy/qa_gateway.py phases`, `evals/liveness/wake_latency.py`, the Desktop friction
+ * record). Each is measured from socket 'open' unless named otherwise; null = not reached
+ * or not applicable to this generation.
+ */
+export interface GatewaySocketPhases {
+  /** connect() call → socket 'open' (DNS/TCP/TLS/upgrade leg). */
+  dial_ms: number | null
+  /** socket 'open' → the `gateway.ready` event frame. */
+  ready_ms: number | null
+  /** socket 'open' → the last reconnect replay barrier released (null: no replay was fetched). */
+  replay_barrier_ms: number | null
+  /** socket 'open' → the first response frame (the first usable application round trip). */
+  usable_ms: number | null
 }
 
 const ANY = '*'
@@ -124,6 +148,17 @@ interface SessionReplay {
   resolve: (valid: boolean) => void
 }
 
+/** One socket generation's phase stamps (absolute instants; durations are read off them). */
+interface SocketPhaseWatch {
+  dialStartedAt: number
+  openedAt: number
+  readyAt: number | null
+  replayRequested: boolean
+  replaySettledAt: number | null
+  usableAt: number | null
+  emitted: boolean
+}
+
 /**
  * Most reconnect cursors one client keeps (least recently advanced retire first). Owners keep
  * replay rings for at most 64 sessions (`tui_gateway/event_replay.py::_REPLAY_SESSIONS_MAX`), so a
@@ -165,10 +200,20 @@ export class JsonRpcGatewayClient {
   /** Canonical authorities number events per session; a session's own epoch outranks the process one. */
   private replayEpochBySession = new Map<string, string>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
+  /** Per-generation C1 phase stamps (t_c1f387b2); null while no generation is open. */
+  private phaseWatch: SocketPhaseWatch | null = null
+  private dialStartedAt = 0
+  private readonly phaseHandlers = new Set<(phases: GatewaySocketPhases) => void>()
   private readonly options: Required<
-    Omit<GatewayClientOptions, 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'socketFactory'>
+    Omit<
+      GatewayClientOptions,
+      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory'
+    >
   > &
-    Pick<GatewayClientOptions, 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'socketFactory'>
+    Pick<
+      GatewayClientOptions,
+      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory'
+    >
 
   /**
    * This client is the Desktop app on the backend's own machine, read at each socket open
@@ -191,6 +236,7 @@ export class JsonRpcGatewayClient {
       replay: options.replay ?? true,
       requestIdPrefix: options.requestIdPrefix ?? 'r',
       onRequestHandlerError: options.onRequestHandlerError,
+      onSocketPhases: options.onSocketPhases,
       onUncorrelatedError: options.onUncorrelatedError,
       onUnhandledRequest: options.onUnhandledRequest,
       requestTimeoutMs: options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
@@ -206,6 +252,7 @@ export class JsonRpcGatewayClient {
       // deadline.
       heartbeatLiveness: 'any-inbound',
       onEvent: event => this.handleEvent(event),
+      onFirstResponse: () => this.markUsable(),
       onHeartbeatFailure: error => this.invalidate(error.message),
       onRequestHandlerError: this.options.onRequestHandlerError,
       onUncorrelatedError: this.options.onUncorrelatedError,
@@ -240,6 +287,7 @@ export class JsonRpcGatewayClient {
       return
     }
 
+    this.dialStartedAt = Date.now()
     this.setState('connecting')
 
     const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
@@ -292,6 +340,17 @@ export class JsonRpcGatewayClient {
 
         settled = true
         cleanup()
+        // Open before attach: the channel's boot capabilities call rides the first
+        // response after this stamp, so it must land inside this generation's watch.
+        this.phaseWatch = {
+          dialStartedAt: this.dialStartedAt,
+          emitted: false,
+          openedAt: Date.now(),
+          readyAt: null,
+          replayRequested: false,
+          replaySettledAt: null,
+          usableAt: null
+        }
         this.channel.attach(transport)
         // Install session barriers before open listeners can start history
         // reads. Replay stays fire-and-forget; connect latency is unchanged.
@@ -433,6 +492,66 @@ export class JsonRpcGatewayClient {
     return () => this.stateHandlers.delete(handler)
   }
 
+  /**
+   * C1 reconnect telemetry (t_c1f387b2): receive one GatewaySocketPhases per socket generation
+   * (complete, or partial when the generation died before finishing its open handshake chain).
+   */
+  onSocketPhases(handler: (phases: GatewaySocketPhases) => void): () => void {
+    this.phaseHandlers.add(handler)
+
+    return () => this.phaseHandlers.delete(handler)
+  }
+
+  /** First response frame of the current generation: the socket is application-usable. */
+  private markUsable(): void {
+    const watch = this.phaseWatch
+
+    if (watch && watch.usableAt === null) {
+      watch.usableAt = Date.now()
+      this.maybeEmitSocketPhases()
+    }
+  }
+
+  /** All reconnect replay barriers released (or revoked by an epoch change / drop). */
+  private markReplayBarrierReleased(): void {
+    const watch = this.phaseWatch
+
+    if (watch && watch.replayRequested && watch.replaySettledAt === null) {
+      watch.replaySettledAt = Date.now()
+      this.maybeEmitSocketPhases()
+    }
+  }
+
+  /** Emit once per generation when usable has landed and no replay barrier is still outstanding. */
+  private maybeEmitSocketPhases(): void {
+    const watch = this.phaseWatch
+
+    if (!watch || watch.emitted || watch.usableAt === null || (watch.replayRequested && watch.replaySettledAt === null)) {
+      return
+    }
+
+    watch.emitted = true
+    this.emitSocketPhases(watch)
+  }
+
+  private emitSocketPhases(watch: SocketPhaseWatch): void {
+    const phases: GatewaySocketPhases = {
+      dial_ms: Math.max(0, watch.openedAt - watch.dialStartedAt),
+      ready_ms: watch.readyAt === null ? null : Math.max(0, watch.readyAt - watch.openedAt),
+      replay_barrier_ms:
+        watch.replayRequested && watch.replaySettledAt !== null
+          ? Math.max(0, watch.replaySettledAt - watch.openedAt)
+          : null,
+      usable_ms: watch.usableAt === null ? null : Math.max(0, watch.usableAt - watch.openedAt)
+    }
+
+    this.options.onSocketPhases?.(phases)
+
+    for (const handler of this.phaseHandlers) {
+      handler(phases)
+    }
+  }
+
   request<T>(
     method: string,
     params: Record<string, unknown> = {},
@@ -454,6 +573,10 @@ export class JsonRpcGatewayClient {
 
   private handleEvent(event: GatewayEvent): void {
     if (isGatewayReady(event)) {
+      if (this.phaseWatch && this.phaseWatch.readyAt === null) {
+        this.phaseWatch.readyAt = Date.now()
+      }
+
       if (event.payload?.heartbeat === true) {
         this.channel.startHeartbeat()
       }
@@ -578,6 +701,9 @@ export class JsonRpcGatewayClient {
     }
 
     this.replayHold = hold
+    if (this.phaseWatch) {
+      this.phaseWatch.replayRequested = true
+    }
 
     // A hung background session must not hold a ready session's transcript.
     for (const [sid, lastSeen] of entries) {
@@ -803,6 +929,7 @@ export class JsonRpcGatewayClient {
 
     if (this.replayHold?.size === 0) {
       this.replayHold = null
+      this.markReplayBarrierReleased()
     }
 
     replay.resolve(true)
@@ -825,6 +952,11 @@ export class JsonRpcGatewayClient {
     this.replayGeneration += 1
     this.replayHold = null
 
+    if (hold) {
+      // Revoked barriers are released barriers: waiting reads proceed (or were abandoned).
+      this.markReplayBarrierReleased()
+    }
+
     for (const replay of hold?.values() ?? []) {
       replay.resolve(readsMayProceed)
     }
@@ -838,6 +970,15 @@ export class JsonRpcGatewayClient {
     // rejects its requests asynchronously, so clear its ownership now; the
     // next open can immediately schedule a replay of its own.
     this.cancelReplay(false)
+    // C1: a generation that died before finishing reports what it reached (once).
+    const watch = this.phaseWatch
+
+    this.phaseWatch = null
+
+    if (watch && !watch.emitted) {
+      watch.emitted = true
+      this.emitSocketPhases(watch)
+    }
     this.socket = null
     this.channel.detach(error)
     this.setState('closed')

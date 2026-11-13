@@ -3,17 +3,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $workspaceMode } from '@/components/pane-shell/workspace-scope'
 
 import {
+  beginReconnectEpisode,
   bindDesktopMetrics,
   closeOnboardingStep,
   completeFlow,
   configPatchKeys,
   DESKTOP_METRICS_STATE_KEY,
+  ensureReconnectEpisode,
   noteAreaClosed,
   noteBackendDrop,
   noteBackendExited,
   noteInteraction,
   noteMessageSent,
+  noteReconnectDetection,
+  noteReconnectPreIpc,
+  noteReconnectSocketPhases,
   noticeIdForToast,
+  reconnectCloseReason,
+  reconnectTotalBucket,
   recordAction,
   recordDislike,
   recordFeatureToggle,
@@ -26,6 +33,7 @@ import {
   setDesktopBotCount,
   setDesktopMetricsGate,
   settingsArea,
+  settleReconnectEpisode,
   slowFrameBucket,
   tickDesktopMetrics,
   trackArea,
@@ -537,5 +545,117 @@ describe('per profile, per window', () => {
     setDesktopMetricsGate('on')
     await flush()
     expect(later.calls).toEqual([])
+  })
+})
+
+describe('reconnect episode (C1, t_c1f387b2)', () => {
+  const socketPhases = (over: Partial<Record<'dial_ms' | 'ready_ms' | 'replay_barrier_ms' | 'usable_ms', number | null>> = {}) => ({
+    dial_ms: 8,
+    ready_ms: 14,
+    replay_barrier_ms: 22,
+    usable_ms: 40,
+    ...over
+  })
+
+  function logLines() {
+    const logLine = vi.fn()
+
+    ;(window as unknown as { hermesDesktop: { logLine?: unknown } }).hermesDesktop.logLine = logLine
+
+    return logLine
+  }
+
+  it('buckets around the <1 s program contract', () => {
+    expect(reconnectTotalBucket(0)).toBe('lt_1s')
+    expect(reconnectTotalBucket(999)).toBe('lt_1s')
+    expect(reconnectTotalBucket(1000)).toBe('1s_to_3s')
+    expect(reconnectTotalBucket(2999)).toBe('1s_to_3s')
+    expect(reconnectTotalBucket(3000)).toBe('3s_to_10s')
+    expect(reconnectTotalBucket(9050)).toBe('3s_to_10s')
+    expect(reconnectTotalBucket(29_999)).toBe('10s_to_30s')
+    expect(reconnectTotalBucket(30_000)).toBe('gte_30s')
+  })
+
+  it('one log line and one friction record per close→usable episode', async () => {
+    const { calls, request } = requester()
+
+    setDesktopMetricsGate('on')
+    bindDesktopMetrics(request)
+    const logged = logLines()
+
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'hidden' })
+    vi.setSystemTime(DAY1 + 7_900)
+    noteReconnectDetection()
+    vi.setSystemTime(DAY1 + 9_000)
+    noteReconnectPreIpc()
+    noteReconnectSocketPhases(socketPhases({ usable_ms: null })) // partial: must not settle yet
+    expect(logged).not.toHaveBeenCalled()
+    vi.setSystemTime(DAY1 + 9_050)
+    noteReconnectSocketPhases(socketPhases()) // usable lands: episode over
+
+    const line = String(logged.mock.calls[0]?.[0] ?? '')
+
+    expect(line).toContain('reconnect-episode')
+    expect(line).toContain('detect_ms=7900')
+    expect(line).toContain('pre_ipc_ms=1100')
+    expect(line).toContain('dial_ms=8')
+    expect(line).toContain('ready_ms=14')
+    expect(line).toContain('replay_barrier_ms=22')
+    expect(line).toContain('usable_ms=40')
+    expect(line).toContain('total_ms=9050')
+    expect(line).toContain('outcome=usable')
+    expect(line).toContain('close_reason=network')
+    expect(line).toContain('visibility_at_close=hidden')
+    expect(logged).toHaveBeenCalledTimes(1)
+
+    await flush()
+    expect(calls.filter(([m]) => m === 'shared_metrics.desktop_friction').map(([, p]) => [p.kind, p.detail])).toEqual([
+      ['reconnect_episode', '3s_to_10s']
+    ])
+  })
+
+  it('the log line lands with telemetry off; nothing is sent', async () => {
+    const { calls, request } = requester()
+
+    setDesktopMetricsGate('off')
+    bindDesktopMetrics(request)
+    const logged = logLines()
+
+    beginReconnectEpisode({ closeReason: 'wake', visibilityAtClose: 'visible' })
+    ensureReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'hidden' }) // wake opened it; the drop must not clobber
+    noteReconnectDetection()
+    vi.setSystemTime(DAY1 + 5)
+    settleReconnectEpisode('abandoned')
+
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('close_reason=wake')
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('pre_ipc_ms=n/a')
+    expect(calls).toEqual([])
+  })
+
+  it('an episode replaced by a fresh close settles as retrying/failed and the clock restarts', async () => {
+    const { calls, request } = requester()
+
+    setDesktopMetricsGate('on')
+    bindDesktopMetrics(request)
+    const logged = logLines()
+
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'visible' })
+    vi.setSystemTime(DAY1 + 500)
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'visible' }) // the redial's socket dropped too
+
+    expect(logged).toHaveBeenCalledTimes(1)
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('outcome=retrying')
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('usable_ms=n/a')
+
+    await flush()
+    expect(calls.filter(([m]) => m === 'shared_metrics.desktop_friction').map(([, p]) => p.detail)).toEqual(['failed'])
+
+    resetDesktopMetricsForTests()
+  })
+
+  it('tags an episode no drop edge opened with the redial trigger, not always a wake', () => {
+    // C2a reads close_reason to tell a wake nudge from the user hitting Reconnect.
+    expect(reconnectCloseReason(false)).toBe('wake')
+    expect(reconnectCloseReason(true)).toBe('manual')
   })
 })

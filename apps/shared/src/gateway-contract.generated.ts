@@ -772,7 +772,7 @@ export interface SharedMetricsDesktopFeatureUseParams {
 export interface OkResult {
   ok?: boolean
 }
-/** ``kind`` notice_dismissed|error_toast|renderer_crash|backend_disconnect|slow_frame; ``detail`` a closed code-defined word for that kind (notice id, error category, crash reason, drop reason, frame duration bucket), never message text. */
+/** ``kind`` notice_dismissed|error_toast|renderer_crash|backend_disconnect|reconnect_episode|slow_frame; ``detail`` a closed code-defined word for that kind (notice id, error category, crash reason, drop reason, reconnect-total bucket, frame duration bucket), never message text. */
 export interface SharedMetricsDesktopFrictionParams {
   profile?: string | null
   kind: string
