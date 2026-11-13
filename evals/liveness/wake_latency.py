@@ -325,30 +325,36 @@ def main(argv):
             },
         }
         if args.json:
-            print(json.dumps(trace, indent=2))
+            # sys.__stdout__: tui_gateway.server wraps sys.stdout for its stdio transport,
+            # which would swallow the report (the orphan eval prints its trace to stderr for
+            # the same reason). The real stdout is what callers of this script read.
+            print(json.dumps(trace, indent=2), file=sys.__stdout__)
         else:
+            def out(*parts):
+                print(*parts, file=sys.__stdout__)
+
             header = "cycle".ljust(6) + "".join(name.rjust(19) for name in PHASES)
-            print(header)
-            print("-" * len(header))
+            out(header)
+            out("-" * len(header))
             for i, row in enumerate(rows, start=1):
-                print(str(i).ljust(6) + "".join(fmt(row[name]).rjust(19) for name in PHASES))
-            print("-" * len(header))
+                out(str(i).ljust(6) + "".join(fmt(row[name]).rjust(19) for name in PHASES))
+            out("-" * len(header))
             for label, q in (("p50", 0.50), ("p95", 0.95)):
                 cells = []
                 for name in PHASES:
                     values = [row[name] for row in rows if row[name] is not None]
                     cells.append(fmt(percentile(values, q) if values else None).rjust(19))
-                print(label.ljust(6) + "".join(cells))
-            print(f"\nn={len(rows)} cycles; all values are milliseconds.")
-            print(f"server closes: {len(closes)}  initiated: {initiated}  "
-                  f"silent_s p50 {percentile(silent, 0.50):.3f}  life_s p50 {percentile(life, 0.50):.3f}")
-            print("detect_ms is ~0 by construction: loopback delivers the close, so the wake probe")
-            print("fails on the first attempt. Backoff + heartbeat-deadline detection (the 7.9-8.9 s")
-            print("production story) measures via the Desktop reconnect-episode log line, and with the")
-            print("netem variant in this file's docstring.")
-            print("pre_ipc_ms is n/a here: this mount has no HTTP ticket surface; deploy/qa_gateway.py")
-            print("phases measures it on the real test instance (:10119), same column names.")
-            print(f"result: PASS ({sum(1 for row in rows if row['events_replayed'] > 0)} cycles replayed events)")
+                out(label.ljust(6) + "".join(cells))
+            out(f"\nn={len(rows)} cycles; all values are milliseconds.")
+            out(f"server closes: {len(closes)}  initiated: {initiated}  "
+                f"silent_s p50 {percentile(silent, 0.50):.3f}  life_s p50 {percentile(life, 0.50):.3f}")
+            out("detect_ms is ~0 by construction: loopback delivers the close, so the wake probe")
+            out("fails on the first attempt. Backoff + heartbeat-deadline detection (the 7.9-8.9 s")
+            out("production story) measures via the Desktop reconnect-episode log line, and with the")
+            out("netem variant in this file's docstring.")
+            out("pre_ipc_ms is n/a here: this mount has no HTTP ticket surface; deploy/qa_gateway.py")
+            out("phases measures it on the real test instance (:10119), same column names.")
+            out(f"result: PASS ({sum(1 for row in rows if row['events_replayed'] > 0)} cycles replayed events)")
         return 0
     finally:
         ws_logger.removeHandler(close_lines)
