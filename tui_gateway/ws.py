@@ -438,7 +438,9 @@ _WS_PEER_FAREWELL_CLOSE_CODES = frozenset({1000, 1001})
 #: reports exactly this for any TCP loss, so a client that vanished and a server keepalive ping
 #: that timed out are the SAME report (``connection_lost`` queues 1005). The line therefore names
 #: both outcomes and leaves the split to ``silent_s`` against the surface's configured
-#: ``ws_ping_interval + ws_ping_timeout`` budget. The brief's "a keepalive failure is coded 1012"
+#: ``ws_ping_interval + ws_ping_timeout`` budget — doubled to ``interval + 2*timeout`` where the
+#: two-strike policy fits the tunnel idle cap (``hermes_cli/web_server_keepalive.py``, C2a).
+#: The brief's "a keepalive failure is coded 1012"
 #: (desktop-reconnect-under-1s.md, flagged unverified there) is FALSE for this stack: 1012 is
 #: uvicorn's graceful-shutdown notice and the sansio keepalive kill lands here, as 1005 — which
 #: is arithmetically consistent with the measured 40 s churn grid, because production's dashboard
