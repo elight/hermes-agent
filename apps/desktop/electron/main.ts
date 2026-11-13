@@ -6214,13 +6214,13 @@ function registerPowerResumeListeners() {
     powerMonitor.on('on-battery', () => broadcastBatteryState(true))
     powerMonitor.on('on-ac', () => broadcastBatteryState(false))
     onBatteryPower = powerMonitor.isOnBatteryPower()
-    // Pooled remote/SSH backends are also suspect after a wake (#93910): the
-    // renderer nudge above only re-drives the PRIMARY socket, while pooled
-    // tunnels have no renderer loop of their own. Bounded + coalesced inside;
-    // never a hot loop.
+    // Pooled remote/SSH backends are suspect after a wake too (#93910): only the
+    // PRIMARY socket has a renderer loop. Cheap probe on every signal, the
+    // destructive sweep coalesced inside (#C2a); never a hot loop.
     attachPowerResumeRemoteRevalidation({
       log: rememberLog,
       powerMonitor,
+      probe: () => revalidatePool(),
       revalidate: () => revalidateSuspectPoolAfterResume()
     })
   } catch {
