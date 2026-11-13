@@ -211,6 +211,15 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
 
   return {
     bindSignals: (signal: () => void) => {
+      // A fresh bind RE-READS the document: the latch is a function of what the
+      // window is doing, so a stale park (an editor reload while hidden, a mount
+      // that missed the event) can never latch a visible window's ladders off.
+      if (document.visibilityState === 'hidden') {
+        parkSecondaryReconnects()
+      } else {
+        unparkSecondaryReconnects()
+      }
+
       const onOnline = () => signal()
       const onFocus = () => signal()
 

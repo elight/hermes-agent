@@ -1,6 +1,7 @@
 import { act, render } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { parkSecondaryReconnects } from '@/store/gateway-park'
 import { $gatewayState } from '@/store/session'
 
 import { FakeWebSocket } from '../../../test/fake-gateway-socket'
@@ -114,6 +115,33 @@ describe('useGatewayBoot wake path (#C2a)', () => {
     })
 
     expect(desktop.getGatewayWsUrl.mock.calls.length).toBe(mintsAfterBoot + 1)
+    expect($gatewayState.get()).toBe('open')
+  })
+
+  // A previous mount parked the window and never came back (the visibility
+  // change landed while it was hidden). The latch is a function of the document,
+  // so binding the signals re-reads it: a visible window must never inherit a
+  // stale park and sit with its ladders latched off.
+  it('re-reads the document on mount: a stale park cannot latch a visible window off', async () => {
+    const desktop = fakeDesktop()
+
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    parkSecondaryReconnects()
+
+    render(<Harness />)
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+
+    const staleSocket = FakeWebSocket.instances.at(-1)!
+
+    FakeWebSocket.pingMode = 'silent'
+    act(() => window.dispatchEvent(new Event('online')))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250)
+    })
+
+    expect(FakeWebSocket.instances.length).toBe(2)
+    expect(staleSocket.readyState).toBe(FakeWebSocket.CLOSED)
     expect($gatewayState.get()).toBe('open')
   })
 
