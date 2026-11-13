@@ -1,3 +1,4 @@
+import type { GatewayEvent } from '@hermes/shared'
 /**
  * Shared harness for the useGatewayBoot suites (#C2a).
  *
@@ -126,16 +127,18 @@ export function fakeDesktop() {
 
 export function Harness({
   beforeConnectionSwitch = () => undefined,
+  handleGatewayEvent = () => undefined,
   refreshHermesConfig = async () => undefined,
   refreshSessions
 }: {
   beforeConnectionSwitch?: () => void
+  handleGatewayEvent?: (event: GatewayEvent) => void
   refreshHermesConfig?: (force?: boolean, shouldPublish?: () => boolean) => Promise<void>
   refreshSessions?: (shouldPublish?: () => boolean) => Promise<void>
 } = {}) {
   useGatewayBoot({
     beforeConnectionSwitch,
-    handleGatewayEvent: () => undefined,
+    handleGatewayEvent,
     handleServerRequest: () => false,
     onConnectionReady: () => undefined,
     onGatewayReady: () => undefined,
