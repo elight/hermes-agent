@@ -1191,6 +1191,26 @@ export function useGatewayBoot({
     // events with whatever was active when the gateway booted.
     const sourceProfileNow = () => normalizeProfileKey($activeGatewayProfile.get())
 
+    // Bookkeeping a healthy primary owes the window on opening, under one name
+    // (C2a r2): the wake's replacement path is about to need it too.
+    const notePrimaryOpened = () => {
+      bootSnapshotSuperseded = true
+      openedAt = Date.now()
+      reauthNotified = false
+      primaryReauthError = null
+      probe.noteHealthy()
+      clearReconnectTimer()
+
+      // A revalidate-driven reconnect can rebuild the backend in place when the
+      // cached remote was found dead, which re-drives the boot-progress overlay.
+      // Unlike the initial boot, nothing calls completeDesktopBoot() afterwards,
+      // so dismiss it here once we're open again — otherwise the overlay sticks
+      // at ~94%. A no-op on a normal (non-rebuild) reconnect.
+      if (bootCompleted) {
+        completeDesktopBoot()
+      }
+    }
+
     /**
      * Everything a PRIMARY client is wired to, as one attach/detach pair.
      *
@@ -1211,21 +1231,7 @@ export function useGatewayBoot({
         reportPrimaryGatewayState(st)
 
         if (st === 'open') {
-          bootSnapshotSuperseded = true
-          openedAt = Date.now()
-          reauthNotified = false
-          primaryReauthError = null
-          probe.noteHealthy()
-          clearReconnectTimer()
-
-          // A revalidate-driven reconnect can rebuild the backend in place when the
-          // cached remote was found dead, which re-drives the boot-progress overlay.
-          // Unlike the initial boot, nothing calls completeDesktopBoot() afterwards,
-          // so dismiss it here once we're open again — otherwise the overlay sticks
-          // at ~94%. A no-op on a normal (non-rebuild) reconnect.
-          if (bootCompleted) {
-            completeDesktopBoot()
-          }
+          notePrimaryOpened()
         } else if (st === 'closed' || st === 'error') {
           if (isStableOpen(openedAt)) {
             resetReconnectBackoff()
