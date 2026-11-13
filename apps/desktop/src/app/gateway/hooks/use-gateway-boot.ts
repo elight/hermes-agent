@@ -37,7 +37,16 @@ import {
 } from '@/store/boot'
 import { resetBackgroundPollingGuard } from '@/store/composer-status'
 import { primaryWireSource, recordConnectionWire } from '@/store/connection-wire'
-import { noteBackendDrop, noteBackendExited } from '@/store/desktop-metrics'
+import {
+  beginReconnectEpisode,
+  ensureReconnectEpisode,
+  noteBackendDrop,
+  noteBackendExited,
+  noteReconnectDetection,
+  noteReconnectPreIpc,
+  noteReconnectSocketPhases,
+  settleReconnectEpisode
+} from '@/store/desktop-metrics'
 import {
   $gateway,
   activeGateway,
@@ -459,6 +468,10 @@ export function useGatewayBoot({
     // genuinely changes between reads).
     const gatewayOpen = () => gateway.connectionState === 'open'
 
+    // C1 (t_c1f387b2): the window's visibility, recorded at episode start — a hidden-window
+    // detection story is the whole reconnect-under-1s question.
+    const windowVisibility = (): 'hidden' | 'visible' => (document.visibilityState === 'hidden' ? 'hidden' : 'visible')
+
     const clearReconnectTimer = () => {
       if (reconnectTimer !== null) {
         clearTimeout(reconnectTimer)
@@ -494,6 +507,12 @@ export function useGatewayBoot({
       }
 
       reconnecting = true
+
+      // C1 episode: the redial decision ends detection. An episode opened by the drop edge
+      // keeps its clock; a silent (half-open) death is first noticed on a wake/focus nudge,
+      // so ensure one exists before stamping detection done.
+      ensureReconnectEpisode({ closeReason: 'wake', visibilityAtClose: windowVisibility() })
+      noteReconnectDetection()
 
       try {
         // Drop a stale REMOTE backend cache before re-dialing. After sleep/wake a
@@ -562,6 +581,10 @@ export function useGatewayBoot({
         if (cancelled || dialRevision !== primaryRouteRevision) {
           return
         }
+
+        // C1: revalidate + connection lookup + ticket mint are the serial pre-IPC leg;
+        // its end is where the dial clock starts.
+        noteReconnectPreIpc()
 
         await gateway.connect(wsUrl)
 
@@ -1166,6 +1189,10 @@ export function useGatewayBoot({
     const offActiveGatewayReauth = $gateway.listen(syncPrimaryReauthError)
     const offActiveStateReauth = $gatewayState.listen(syncPrimaryReauthError)
 
+    // C1 (t_c1f387b2): the shared client measures dial/ready/replay-barrier/usable per socket
+    // generation; they fill the open reconnect episode, which settles on the usable stamp.
+    const offSocketPhases = gateway.onSocketPhases(phases => noteReconnectSocketPhases(phases))
+
     const offState = gateway.onState(st => {
       // Mirror to the composer only while the primary is the active profile —
       // a background secondary reconnect mustn't flip the foreground state.
@@ -1196,6 +1223,13 @@ export function useGatewayBoot({
         // The connected→disconnected edge after a healthy boot, not a switch or our own manual close.
         if (openedAt !== null && bootCompleted && !$gatewaySwitching.get() && ownCloseReason !== 'manual') {
           noteBackendDrop(ownCloseReason === 'timeout' ? 'timeout' : null)
+          // C1: the close starts the episode clock; detect_ms runs to the redial decision,
+          // so the backoff ladder and wake holdoffs live inside it — the fat the reconnect
+          // brief measured at 7.9–8.9 s in production logs.
+          beginReconnectEpisode({
+            closeReason: ownCloseReason === 'timeout' ? 'timeout' : 'network',
+            visibilityAtClose: windowVisibility()
+          })
         }
 
         ownCloseReason = null
@@ -1769,6 +1803,8 @@ export function useGatewayBoot({
 
     return () => {
       cancelled = true
+      // C1: a window torn down mid-reconnect still gets its episode record.
+      settleReconnectEpisode('abandoned')
       offSwitchLifecycle()
       endGatewaySwitch()
       clearReconnectTimer()
@@ -1792,6 +1828,7 @@ export function useGatewayBoot({
       offGatewayReconnect()
       offActiveGatewayReauth()
       offActiveStateReauth()
+      offSocketPhases()
       offState()
       offEvent()
       offRequest()

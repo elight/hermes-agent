@@ -158,6 +158,11 @@ export interface JsonRpcRequestChannelOptions {
    * The backend offers the welcome trial and first-run onboarding only to that client.
    */
   desktopLocal?: () => boolean
+  /**
+   * Observation only (C1 reconnect telemetry): fired once per attach when the first response
+   * frame arrives — the first application round trip on a fresh socket. Never changes dispatch.
+   */
+  onFirstResponse?: () => void
 }
 
 export type HeartbeatLiveness = 'any-inbound' | 'response'
@@ -220,6 +225,8 @@ export class JsonRpcRequestChannel {
   private heartbeatSequence = 0
   private readonly outstandingPings = new Set<string>()
   private lastLivenessAt = 0
+  /** C1 phase observation: has the CURRENT attach seen its first response frame yet. */
+  private firstResponseSeen = false
   /** The bound generation's backend counts `decline` as one client abstaining (see `ServerRequest.decline`). */
   private backendCountsDeclines = false
   /** The bound generation's canonical owner admits `clarify_batch` on `prompt.submit` (`client.capabilities`). */
@@ -238,6 +245,7 @@ export class JsonRpcRequestChannel {
       heartbeatIntervalMs: options.heartbeatIntervalMs ?? DEFAULT_HEARTBEAT_INTERVAL_MS,
       heartbeatLiveness: options.heartbeatLiveness ?? 'response',
       onEvent: options.onEvent,
+      onFirstResponse: options.onFirstResponse ?? (() => undefined),
       onHeartbeatFailure: options.onHeartbeatFailure,
       onRequestHandlerError: options.onRequestHandlerError,
       onUncorrelatedError: options.onUncorrelatedError,
@@ -266,6 +274,7 @@ export class JsonRpcRequestChannel {
     this.stopHeartbeat()
     this.transport = transport
     this.lastLivenessAt = Date.now()
+    this.firstResponseSeen = false
     this.backendCountsDeclines = false
     this.backendClarifyBatch = false
 
@@ -532,6 +541,10 @@ export class JsonRpcRequestChannel {
     }
 
     if (frame.id !== undefined && frame.id !== null) {
+      if (!this.firstResponseSeen) {
+        this.firstResponseSeen = true
+        this.options.onFirstResponse()
+      }
       this.settleResponse(frame.id, frame)
 
       return frame

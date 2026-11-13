@@ -29,7 +29,7 @@
  * instead of overwriting each other; the backend latches each day and area once.
  */
 
-import { randomUuid } from '@hermes/shared'
+import { type GatewaySocketPhases, randomUuid } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { $workspaceMode } from '@/components/pane-shell/workspace-scope'
@@ -150,7 +150,12 @@ export function routeArea(pathname: string, contributedPaths: readonly string[] 
 }
 
 export type DesktopFrictionKind =
-  'backend_disconnect' | 'error_toast' | 'notice_dismissed' | 'renderer_crash' | 'slow_frame'
+  | 'backend_disconnect'
+  | 'error_toast'
+  | 'notice_dismissed'
+  | 'reconnect_episode'
+  | 'renderer_crash'
+  | 'slow_frame'
 
 /** notifyError's summary rules (store/notifications.ts) → category. */
 export type ErrorToastCategory =
@@ -227,7 +232,21 @@ export function noticeIdForToast(id: string): DesktopNoticeId {
 
 export type RendererCrashDetail = 'crash' | 'killed' | 'oom' | 'other'
 export type BackendDisconnectDetail = 'backend_exit' | 'network' | 'other' | 'timeout'
+/** Reconnect episode total (close → usable), bucketed around the <1 s program contract. */
+export type ReconnectEpisodeBucket = 'failed' | 'gte_30s' | 'lt_1s' | '1s_to_3s' | '3s_to_10s' | '10s_to_30s'
 export type SlowFrameBucket = '100ms_to_250ms' | '1s_to_5s' | '250ms_to_1s' | 'gte_5s'
+
+export function reconnectTotalBucket(durationMs: number): ReconnectEpisodeBucket {
+  return durationMs < 1000
+    ? 'lt_1s'
+    : durationMs < 3000
+      ? '1s_to_3s'
+      : durationMs < 10_000
+        ? '3s_to_10s'
+        : durationMs < 30_000
+          ? '10s_to_30s'
+          : 'gte_30s'
+}
 
 export function slowFrameBucket(durationMs: number): SlowFrameBucket | null {
   if (!(durationMs >= 100)) {
@@ -244,7 +263,12 @@ export function slowFrameBucket(durationMs: number): SlowFrameBucket | null {
 }
 
 export type DesktopFrictionDetail =
-  BackendDisconnectDetail | DesktopNoticeId | ErrorToastCategory | RendererCrashDetail | SlowFrameBucket
+  | BackendDisconnectDetail
+  | DesktopNoticeId
+  | ErrorToastCategory
+  | ReconnectEpisodeBucket
+  | RendererCrashDetail
+  | SlowFrameBucket
 
 export type DesktopOnboardingStep =
   | 'choose_later'
@@ -619,6 +643,121 @@ export function cancelPendingBackendDrop(): void {
   }
 }
 
+// ── reconnect episode (C1, t_c1f387b2) ─────────────────────────────────────────
+// One record per close→usable reconnect episode, carrying the C1 phase contract
+// (detect/pre-IPC/dial/ready/replay-barrier/usable) plus the close reason and the
+// window's visibility at close. The exact milliseconds go to the LOCAL desktop log
+// (the same log-parsing surface the reconnect brief measured production from — it
+// works whether or not telemetry is opted in); the opt-in telemetry counter carries
+// only the total bucket. Logging only: no timer or reconnect behaviour changes.
+
+export type ReconnectCloseReason = 'manual' | 'network' | 'timeout' | 'wake'
+export type ReconnectVisibility = 'hidden' | 'visible'
+
+interface ReconnectEpisode {
+  closeReason: ReconnectCloseReason
+  detectDoneAt: number | null
+  preIpcDoneAt: number | null
+  socketPhases: GatewaySocketPhases | null
+  startedAt: number
+  visibilityAtClose: ReconnectVisibility
+}
+
+let reconnectEpisode: ReconnectEpisode | null = null
+
+/** Start the clock for a new episode; a previous one that never landed settles as `retrying`. */
+export function beginReconnectEpisode(
+  init: { closeReason: ReconnectCloseReason; visibilityAtClose: ReconnectVisibility },
+  now = Date.now()
+): void {
+  if (reconnectEpisode) {
+    settleReconnectEpisode('retrying', now)
+  }
+
+  reconnectEpisode = {
+    closeReason: init.closeReason,
+    detectDoneAt: null,
+    preIpcDoneAt: null,
+    socketPhases: null,
+    startedAt: now,
+    visibilityAtClose: init.visibilityAtClose
+  }
+}
+
+/** Begin only when no episode is already open (a wake nudge after a silent drop). */
+export function ensureReconnectEpisode(
+  init: { closeReason: ReconnectCloseReason; visibilityAtClose: ReconnectVisibility },
+  now = Date.now()
+): void {
+  if (!reconnectEpisode) {
+    beginReconnectEpisode(init, now)
+  }
+}
+
+/** Detection ended: the redial decision was made (detect_ms = close/signal → here). */
+export function noteReconnectDetection(now = Date.now()): void {
+  if (reconnectEpisode && reconnectEpisode.detectDoneAt === null) {
+    reconnectEpisode.detectDoneAt = now
+  }
+}
+
+/** Pre-IPC chain done (revalidate + getConnection + ticket mint); the dial begins next. */
+export function noteReconnectPreIpc(now = Date.now()): void {
+  if (reconnectEpisode && reconnectEpisode.preIpcDoneAt === null) {
+    reconnectEpisode.preIpcDoneAt = now
+  }
+}
+
+/**
+ * Phases of a socket generation (JsonRpcGatewayClient.onSocketPhases). Partial emissions
+ * (a generation that died mid-handshake) are kept for the episode's log line; the usable
+ * round trip is the end of the episode.
+ */
+export function noteReconnectSocketPhases(phases: GatewaySocketPhases): void {
+  if (!reconnectEpisode) {
+    return
+  }
+
+  reconnectEpisode.socketPhases = phases
+
+  if (phases.usable_ms !== null) {
+    settleReconnectEpisode('usable')
+  }
+}
+
+/** Write the episode's log line and its one friction record; no-op when none is open. */
+export function settleReconnectEpisode(outcome: 'abandoned' | 'retrying' | 'usable', now = Date.now()): void {
+  const episode = reconnectEpisode
+
+  reconnectEpisode = null
+
+  if (!episode) {
+    return
+  }
+
+  const detectMs = episode.detectDoneAt === null ? null : episode.detectDoneAt - episode.startedAt
+  const preIpcMs =
+    episode.detectDoneAt === null || episode.preIpcDoneAt === null
+      ? null
+      : Math.max(0, episode.preIpcDoneAt - episode.detectDoneAt)
+  const phases = episode.socketPhases
+  const totalMs = outcome === 'usable' ? Math.max(0, now - episode.startedAt) : null
+  const num = (value: number | null): string => (value === null ? 'n/a' : String(Math.round(value)))
+
+  try {
+    window.hermesDesktop?.logLine?.(
+      `reconnect-episode detect_ms=${num(detectMs)} pre_ipc_ms=${num(preIpcMs)} dial_ms=${num(phases?.dial_ms ?? null)} ` +
+        `ready_ms=${num(phases?.ready_ms ?? null)} replay_barrier_ms=${num(phases?.replay_barrier_ms ?? null)} ` +
+        `usable_ms=${num(phases?.usable_ms ?? null)} total_ms=${num(totalMs)} outcome=${outcome} ` +
+        `close_reason=${episode.closeReason} visibility_at_close=${episode.visibilityAtClose}`
+    )
+  } catch {
+    // Telemetry never surfaces; the log bridge may be an older shell.
+  }
+
+  recordFriction('reconnect_episode', totalMs === null ? 'failed' : reconnectTotalBucket(totalMs))
+}
+
 export function recordFriction(kind: DesktopFrictionKind, detail: DesktopFrictionDetail): void {
   withState(current => {
     if (
@@ -923,6 +1062,7 @@ function forgetInMemory(): void {
   openFlows.clear()
   recentClicks.clear()
   cancelPendingBackendDrop()
+  reconnectEpisode = null
 }
 
 /** Apply the focused profile's collection switch. Off purges everything local. `decided` false
@@ -992,6 +1132,7 @@ export function resetDesktopMetricsForTests(): void {
   openFlows.clear()
   recentClicks.clear()
   cancelPendingBackendDrop()
+  reconnectEpisode = null
   lastBackendExitAt = 0
   $desktopMetricsGate.set(null)
 }

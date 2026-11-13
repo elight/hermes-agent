@@ -708,6 +708,10 @@ DESKTOP_FRICTION_DETAILS: dict[str, frozenset[str]] = {
     "backend_disconnect": frozenset({"backend_exit", "network", "timeout", "other"}),
     "error_toast": DESKTOP_ERROR_TOAST_CATEGORIES,
     "notice_dismissed": DESKTOP_NOTICE_IDS,
+    # reconnect_episode: one record per reconnect episode (close → usable), detail = the total
+    # close→usable bucket; "failed" when the episode never reached a usable round trip. The
+    # per-phase timestamps ride the local desktop log line, never this counter (C1, t_c1f387b2).
+    "reconnect_episode": frozenset({"failed", "gte_30s", "lt_1s", "1s_to_3s", "3s_to_10s", "10s_to_30s"}),
     # Electron render-process-gone reasons: crashed -> crash; oom; killed; anything else -> other.
     "renderer_crash": frozenset({"crash", "killed", "oom", "other"}),
     "slow_frame": DESKTOP_SLOW_FRAME_BUCKETS,
