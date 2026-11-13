@@ -11,12 +11,12 @@
  * and without growing a file that is at its line cap. Each suite keeps its own
  * `vi.mock` declarations, which are per test file.
  */
-import { act, cleanup, render } from '@testing-library/react'
+import { act, cleanup } from '@testing-library/react'
 import { vi } from 'vitest'
 
-import type { DesktopConnectionsRegistry } from '@/global'
-import { useGatewayBoot } from '@/app/gateway/hooks/use-gateway-boot'
 import { takeGatewaySurvivor } from '@/app/gateway/hooks/gateway-hmr-survivor'
+import { useGatewayBoot } from '@/app/gateway/hooks/use-gateway-boot'
+import type { DesktopConnectionsRegistry } from '@/global'
 import { $desktopBoot } from '@/store/boot'
 import { $connectionsRegistry, _resetConnectionsForTests } from '@/store/connections'
 import { closeSecondaryGateways } from '@/store/gateway'
@@ -24,13 +24,11 @@ import { endGatewaySwitch } from '@/store/gateway-switch'
 import { clearNotifications, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import {
-  $activeSessionId,
   $awaitingResponse,
   $busy,
   $connection,
   $currentCwd,
   $gatewayState,
-  $selectedStoredSessionId,
   setActiveSessionId,
   setSelectedStoredSessionId
 } from '@/store/session'
