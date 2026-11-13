@@ -654,6 +654,12 @@ export function cancelPendingBackendDrop(): void {
 export type ReconnectCloseReason = 'manual' | 'network' | 'timeout' | 'wake'
 export type ReconnectVisibility = 'hidden' | 'visible'
 
+/** The trigger that asked for a redial, for an episode no drop edge opened: a manual recovery is
+ * not a wake, and the field is what C2a reads to tell the two apart. */
+export function reconnectCloseReason(manual: boolean): ReconnectCloseReason {
+  return manual ? 'manual' : 'wake'
+}
+
 interface ReconnectEpisode {
   closeReason: ReconnectCloseReason
   detectDoneAt: number | null
@@ -736,10 +742,12 @@ export function settleReconnectEpisode(outcome: 'abandoned' | 'retrying' | 'usab
   }
 
   const detectMs = episode.detectDoneAt === null ? null : episode.detectDoneAt - episode.startedAt
+
   const preIpcMs =
     episode.detectDoneAt === null || episode.preIpcDoneAt === null
       ? null
       : Math.max(0, episode.preIpcDoneAt - episode.detectDoneAt)
+
   const phases = episode.socketPhases
   const totalMs = outcome === 'usable' ? Math.max(0, now - episode.startedAt) : null
   const num = (value: number | null): string => (value === null ? 'n/a' : String(Math.round(value)))

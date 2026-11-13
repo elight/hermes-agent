@@ -50,6 +50,7 @@ a route-level rejection (403 before the handler runs).
 """
 
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -278,11 +279,10 @@ def main(argv):
 
             rows.append(row)
             # sleep: the socket the next cycle wakes to is already dead — a close delivered
-            # while nobody reads, which is what sleep does to a loopback TCP connection.
-            try:
+            # while nobody reads, which is what sleep does to a loopback TCP connection. Failing
+            # to close it is that same death, not a harness fault.
+            with contextlib.suppress(Exception):
                 ws.close()
-            except Exception:
-                pass
             previous = ws
             time.sleep(args.sleep_s)
             wait_for(lambda: len(close_lines.snapshot()) >= cycle,

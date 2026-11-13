@@ -45,6 +45,7 @@ import {
   noteReconnectDetection,
   noteReconnectPreIpc,
   noteReconnectSocketPhases,
+  reconnectCloseReason,
   settleReconnectEpisode
 } from '@/store/desktop-metrics'
 import {
@@ -510,8 +511,12 @@ export function useGatewayBoot({
 
       // C1 episode: the redial decision ends detection. An episode opened by the drop edge
       // keeps its clock; a silent (half-open) death is first noticed on a wake/focus nudge,
-      // so ensure one exists before stamping detection done.
-      ensureReconnectEpisode({ closeReason: 'wake', visibilityAtClose: windowVisibility() })
+      // so ensure one exists before stamping detection done — tagged with the trigger that
+      // actually asked for this redial (a manual recovery is not a wake).
+      ensureReconnectEpisode({
+        closeReason: reconnectCloseReason(manual !== undefined),
+        visibilityAtClose: windowVisibility()
+      })
       noteReconnectDetection()
 
       try {

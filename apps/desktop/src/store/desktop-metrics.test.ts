@@ -3,8 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { $workspaceMode } from '@/components/pane-shell/workspace-scope'
 
 import {
-  bindDesktopMetrics,
   beginReconnectEpisode,
+  bindDesktopMetrics,
   closeOnboardingStep,
   completeFlow,
   configPatchKeys,
@@ -19,6 +19,8 @@ import {
   noteReconnectPreIpc,
   noteReconnectSocketPhases,
   noticeIdForToast,
+  reconnectCloseReason,
+  reconnectTotalBucket,
   recordAction,
   recordDislike,
   recordFeatureToggle,
@@ -26,7 +28,6 @@ import {
   recordFriction,
   recordOnboarding,
   recordSettingsSaved,
-  reconnectTotalBucket,
   resetDesktopMetricsForTests,
   routeArea,
   setDesktopBotCount,
@@ -650,5 +651,11 @@ describe('reconnect episode (C1, t_c1f387b2)', () => {
     expect(calls.filter(([m]) => m === 'shared_metrics.desktop_friction').map(([, p]) => p.detail)).toEqual(['failed'])
 
     resetDesktopMetricsForTests()
+  })
+
+  it('tags an episode no drop edge opened with the redial trigger, not always a wake', () => {
+    // C2a reads close_reason to tell a wake nudge from the user hitting Reconnect.
+    expect(reconnectCloseReason(false)).toBe('wake')
+    expect(reconnectCloseReason(true)).toBe('manual')
   })
 })

@@ -235,6 +235,13 @@ class WSTransport:
         return self._closed
 
     @property
+    def server_closed(self) -> bool:
+        """The SERVER asked this peer's socket to close (send deadline, fanout overflow): the
+        teardown line's ``initiated=server`` signal — latched here rather than inferred from a
+        library close code, which the ASGI disconnect does not preserve."""
+        return self._close_scheduled or self._abort_requested
+
+    @property
     def ws(self) -> Any:
         """The WebSocket this transport writes to (what sign-out tracks a browser tab by)."""
         return self._ws
@@ -424,13 +431,21 @@ def _start_backend_liveness() -> None:
             _log.warning("%s failed", what, exc_info=True)
 
 
-#: Close codes the uvicorn/websockets stack uses when ITS keepalive ping times out —
-#: the C2a falsification signature (a 40 s churn grid whose closes carry these codes is
-#: a server keepalive kill, not a client leaving). Codes per the websockets implementation
-#: that uvicorn ships; the raw ``reason=`` text is always kept verbatim alongside.
-_WS_KEEPALIVE_CLOSE_CODES = frozenset({1011, 1012})
-#: Close codes meaning the peer said goodbye (or vanished without a frame: 1005/1006).
-_WS_PEER_CLOSE_CODES = frozenset({1000, 1001, 1005, 1006})
+#: Close codes a CLIENT's own Close frame carries as a plain goodbye; uvicorn passes the peer's
+#: code and reason through verbatim (``websockets_sansio_impl.py`` handle_parser_exception path).
+_WS_PEER_FAREWELL_CLOSE_CODES = frozenset({1000, 1001})
+#: 1005 after the handshake: the transport died with NO Close frame. uvicorn's sansio protocol
+#: reports exactly this for any TCP loss, so a client that vanished and a server keepalive ping
+#: that timed out are the SAME report (``connection_lost`` queues 1005). The line therefore names
+#: both outcomes and leaves the split to ``silent_s`` against the surface's configured
+#: ``ws_ping_interval + ws_ping_timeout`` budget. The brief's "a keepalive failure is coded 1012"
+#: (desktop-reconnect-under-1s.md, flagged unverified there) is FALSE for this stack: 1012 is
+#: uvicorn's graceful-shutdown notice and the sansio keepalive kill lands here, as 1005 — which
+#: is arithmetically consistent with the measured 40 s churn grid, because production's dashboard
+#: binds 0.0.0.0 (non-loopback → pings ON at the 20/20 default), unlike the loopback test box.
+_WS_UNATTRIBUTED_LOSS_CLOSE_CODE = 1005
+#: 1012: uvicorn's graceful-shutdown notice (``websockets_sansio_impl.py`` shutdown) — a deploy.
+_WS_SHUTDOWN_CLOSE_CODE = 1012
 
 
 def _ws_attach_ready_watchers(transport: WSTransport, authority_connection: Any) -> None:
@@ -461,28 +476,59 @@ def _ws_ready_frame(skin_payload: Any, *, has_session_authority: bool) -> dict:
     }
 
 
-def _ws_close_fields(accepted_at, last_inbound_at, detected_at, reason: str, code: Any, text: str,
-                     *, shutting_down: bool) -> tuple[float, float, str]:
+def _ws_close_fields(accepted_at, last_inbound_at, detected_at, reason: str, code: Any,
+                     *, shutting_down: bool, server_closed: bool) -> tuple[float, float, str]:
     """(life_s, silent_s, initiated) for the ``ws closed`` line — C1 (t_c1f387b2).
 
     ``silent_s`` is the time the socket sat orphaned-silent: last inbound frame to the instant
     the close was DETECTED (a half-open socket's silence is exactly the server-visible detection
-    lag). ``initiated`` names the closer: ``peer`` (normal client close codes), ``keepalive``
-    (the uvicorn/websockets ping-timeout signature C2a is hunting), ``server`` (our send/ready
-    failure), ``shutdown`` (server cancelled it), ``unknown`` — no causal claim is manufactured
-    from missing data.
+    lag). ``initiated`` names the closer, and claims only what the stack can actually show
+    (each label driven through real uvicorn + real ``handle_ws`` in
+    ``tests/tui_gateway/test_ws_close_initiated.py``):
+
+    ``shutdown`` 1012 — uvicorn's graceful-shutdown notice, so every deploy or restart — or a
+    cancelled handler task. ``server`` this server ended it: a failed reply/ready write, a
+    read-lane failure, or its own socket close (send deadline, fanout overflow; latched by the
+    transport, so no close code has to be trusted). ``peer`` a client Close frame saying goodbye
+    (1000/1001). ``peer_or_keepalive`` 1005 — the connection died with no Close frame, which on
+    the production transport is a vanished client and a failed keepalive ping alike; C2a splits
+    that bucket with ``silent_s`` against the surface's ping budget. ``unknown`` anything else:
+    no causal claim is manufactured from missing data.
     """
     life_s = (detected_at - accepted_at) if accepted_at is not None else 0.0
     silent_s = (detected_at - last_inbound_at) if last_inbound_at is not None else 0.0
-    if shutting_down:
+    if shutting_down or code == _WS_SHUTDOWN_CLOSE_CODE:
         return life_s, silent_s, "shutdown"
     if reason.startswith("client_disconnect"):
-        if code in _WS_KEEPALIVE_CLOSE_CODES or "keepalive" in text.lower():
-            return life_s, silent_s, "keepalive"
-        return life_s, silent_s, "peer" if code in _WS_PEER_CLOSE_CODES else "unknown"
+        if server_closed:
+            return life_s, silent_s, "server"
+        if code in _WS_PEER_FAREWELL_CLOSE_CODES:
+            return life_s, silent_s, "peer"
+        if code == _WS_UNATTRIBUTED_LOSS_CLOSE_CODE:
+            return life_s, silent_s, "peer_or_keepalive"
+        return life_s, silent_s, "unknown"
     if "send" in reason or reason == "receive_failed":
         return life_s, silent_s, "server"
     return life_s, silent_s, "unknown"
+
+
+def _ws_log_closed(peer: str, reason: str, counts: tuple[int, int, int, int, int, int],
+                   accepted_at, last_inbound_at, detected_at, code: Any, *,
+                   shutting_down: bool, server_closed: bool) -> None:
+    """The teardown ``ws closed`` line: C1's close fields plus the per-connection counters."""
+    messages, parse_errors, dispatch_crashes, send_failures, reaped, detached = counts
+    life_s, silent_s, initiated = _ws_close_fields(
+        accepted_at, last_inbound_at,
+        detected_at if detected_at is not None else time.monotonic(),
+        reason, code, shutting_down=shutting_down, server_closed=server_closed)
+    _log.info(
+        "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
+        "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d "
+        "life_s=%.2f silent_s=%.2f initiated=%s",
+        peer, reason, messages, parse_errors, dispatch_crashes, send_failures, reaped, detached,
+        life_s, silent_s, initiated,
+    )
+
 
 
 async def _ws_end_reads(concurrent_reads: set, started_reads: set) -> None:
@@ -511,7 +557,7 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
     disconnect_reason = "not_connected"
     # C1 reconnect telemetry (t_c1f387b2), logging only: accept / last-inbound / detection stamps.
     accepted_at = last_inbound_at = disconnect_detected_at = None
-    close_code, close_text = None, ""
+    close_code = None
 
     async def _reply(frame: dict, reason: str, msg: str, *args: Any) -> None:
         """write_async; on failure record *reason*, log *msg* and end the read loop."""
@@ -741,8 +787,8 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
                 raise
             except _WebSocketDisconnect as exc:
                 disconnect_detected_at = time.monotonic()
-                close_code, close_text = getattr(exc, "code", None), str(getattr(exc, "reason", "") or "")
-                disconnect_reason = f"client_disconnect(code={getattr(exc, 'code', None)},reason={getattr(exc, 'reason', None)})"
+                close_code = getattr(exc, "code", None)
+                disconnect_reason = f"client_disconnect(code={close_code},reason={getattr(exc, 'reason', None)})"
                 break
             except Exception:
                 disconnect_detected_at = time.monotonic()
@@ -817,16 +863,11 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             _log.debug("ws close failed peer=%s error=%s", peer, exc)
         # C1 teardown fields (t_c1f387b2): life and orphan-silent time measured to the DETECTION
         # instant, not to the end of this (possibly slow) teardown.
-        shutdown_task = asyncio.current_task()
-        life_s, silent_s, initiated = _ws_close_fields(
-            accepted_at, last_inbound_at,
-            disconnect_detected_at if disconnect_detected_at is not None else time.monotonic(),
-            disconnect_reason, close_code, close_text,
-            shutting_down=bool(shutdown_task is not None and shutdown_task.cancelling()))
-        _log.info(
-            "ws closed peer=%s reason=%s messages=%d parse_errors=%d "
-            "dispatch_crashes=%d send_failures=%d reaped_sessions=%d detached_sessions=%d "
-            "life_s=%.2f silent_s=%.2f initiated=%s",
-            peer, disconnect_reason, messages, parse_errors, dispatch_crashes, send_failures, reaped_sessions, detached_sessions,
-            life_s, silent_s, initiated,
+        task = asyncio.current_task()
+        _ws_log_closed(
+            peer, disconnect_reason,
+            (messages, parse_errors, dispatch_crashes, send_failures, reaped_sessions, detached_sessions),
+            accepted_at, last_inbound_at, disconnect_detected_at, close_code,
+            shutting_down=bool(task is not None and task.cancelling()),
+            server_closed=bool(transport is not None and transport.server_closed),
         )
