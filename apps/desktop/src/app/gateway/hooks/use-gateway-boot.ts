@@ -725,12 +725,17 @@ export function useGatewayBoot({
         const detachPrevious = offPrimary
         gateway = successor
         offPrimary = detachSuccessor
-        detachPrevious()
-
+        // detachPrevious runs at the KEEPING side (#C2a r2): a generation kept
+        // for a running turn stays SERVED until it retires (listener lifetime
+        // = socket lifetime, #95327). Frames both sockets carry are absorbed
+        // by the #120005 gate; stale state edges by the primaryListeners guard.
         setPrimaryGateway(successor, normalizeProfileKey($activeGatewayProfile.get()))
         recordPrimaryConnection(conn)
         callbacksRef.current.onGatewayReady(successor)
         reportPrimaryGatewayState(successor.connectionState)
+        notePrimaryOpened()
+
+        return detachPrevious
       },
       resolveRoute: resolvePrimaryRoute,
       redial: () => attemptReconnect(),
@@ -738,10 +743,10 @@ export function useGatewayBoot({
       noteReauth: notePrimaryReauth
     })
 
-    const wakeNow = () => {
+    const wakeNow = (hard: boolean) => {
       clearReconnectTimer()
       resetReconnectBackoff()
-      wake.wake()
+      wake.wake(hard)
     }
 
     const offWakeSignals = wake.bindSignals(wakeNow)
@@ -1191,8 +1196,8 @@ export function useGatewayBoot({
     // events with whatever was active when the gateway booted.
     const sourceProfileNow = () => normalizeProfileKey($activeGatewayProfile.get())
 
-    // Bookkeeping a healthy primary owes the window on opening, under one name
-    // (C2a r2): the wake's replacement path is about to need it too.
+    // Bookkeeping a healthy primary owes the window on opening; the wake's
+    // promote() drives it too (that successor opened before becoming primary).
     const notePrimaryOpened = () => {
       bootSnapshotSuperseded = true
       openedAt = Date.now()
@@ -1216,9 +1221,10 @@ export function useGatewayBoot({
      *
      * It has to be a function of the client (not of the module) because the wake
      * path REPLACES the primary generation (#C2a): the successor gets the same
-     * four subscriptions before it dials, and the replaced client is detached
-     * before it is closed. Every handler reads the current primary at call time,
-     * so both generations observe one behaviour.
+     * four subscriptions before it dials; the replaced client keeps its own
+     * until it closes (kept for a turn = kept SERVED, #95327). Handlers split
+     * by kind: events deliver for every attached generation (the #120005 gate
+     * absorbs double frames); state edges speak only while `client` IS primary.
      */
     const primaryListeners = (client: HermesGateway): (() => void) => {
       // C1 (t_c1f387b2): the shared client measures dial/ready/replay-barrier/usable per socket
@@ -1226,6 +1232,14 @@ export function useGatewayBoot({
       const offSocketPhases = client.onSocketPhases(phases => noteReconnectSocketPhases(phases))
 
       const offState = client.onState(st => {
+        // Only the CURRENT primary speaks for the window (#C2a r2). A kept
+        // generation stays attached — it must, that is #95327's delivery — but
+        // its socket edges must not flip composer state, open episodes, or
+        // drive the ladder: the successor owns all of that now.
+        if (client !== gateway) {
+          return
+        }
+
         // Mirror to the composer only while the primary is the active profile —
         // a background secondary reconnect mustn't flip the foreground state.
         reportPrimaryGatewayState(st)
@@ -1310,10 +1324,10 @@ export function useGatewayBoot({
 
     let offPrimary = primaryListeners(gateway)
 
-    // Power resume (macOS/Windows): the same one-dial recovery as the module's
-    // own window signals, and the destructive pool sweep it runs is coalesced
-    // there to one per holdoff window (WAKE_RECONNECT_HOLDOFF_MS).
-    const offPowerResume = desktop.onPowerResume?.(wakeNow)
+    // Power resume (macOS/Windows): a HARD one-dial recovery (the socket after
+    // a sleep is presumptively dead), like the module's own window signals;
+    // its destructive pool sweep is coalesced to one per holdoff window.
+    const offPowerResume = desktop.onPowerResume?.(() => wakeNow(true))
     const offConnectionApplied = desktop.onConnectionApplied?.(() => void softSwitch())
 
     const offGatewayReconnect = registerGatewayReconnect(async (options?: GatewayReconnectOptions) => {

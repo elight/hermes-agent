@@ -20,20 +20,28 @@
  *    makes a backgrounded app free and a ten-minute background mint zero
  *    tickets.
  *
- * 2. DIAL, DON'T PROBE. On the return — and on focus / online / power-resume —
- *    a socket that still reports OPEN is presumptively dead: the renderer's
+ * 2. DIAL, DON'T PROBE. On the return — and on online / power-resume — a
+ *    socket that still reports OPEN is presumptively dead: the renderer's
  *    WebSocket object keeps `readyState === OPEN` while the OS threw the
  *    transport away, and no close event ever fires. The old path PROBED that
  *    socket with a 5 s ping before deciding, which is strictly slower than the
  *    dial it protects (measured ticket→accept p50 0.02-0.07 s on the test
- *    instance) and left the user watching a dead socket be proven dead. A wake
- *    now MINTS AND DIALS a replacement generation at once — while the old
+ *    instance) and left the user watching a dead socket be proven dead. A hard
+ *    wake now MINTS AND DIALS a replacement generation at once — while the old
  *    socket stays open, so the window is never un-owned — and retires the old
  *    generation at the earliest safe point:
  *      * nothing was riding it → retire it as soon as the replacement is open;
  *      * a turn was riding it  → keep it (that is #95327: a busy backend must
- *        never have a socket torn out from under a running turn) and retire it
- *        once that turn's claim drains.
+ *        never have a socket torn out from under a running turn), keep it
+ *        SERVED — its listeners live exactly as long as its socket, so the
+ *        running turn's deltas on it still reach the app — and retire it once
+ *        that turn's claim drains.
+ *    The replacement INHERITS the old generation's replay cursors before it
+ *    dials: a fresh client that never asks `session.events.since` is a cold
+ *    boot, and every event of the half-open window would be lost.
+ *    A plain focus is not a hard signal: an alt-tab must never swap a socket
+ *    that reports healthy (the #94769 churn class on the primary); it redials
+ *    only a primary that is not open.
  *    The liveness probe keeps exactly that #95327 job on the paths that still
  *    need it: the restart-followthrough and the pool's forced sweep.
  */
@@ -64,8 +72,13 @@ export interface WakeHost {
   primary: () => HermesGateway
   /** Subscribe a new generation to the window's primary handlers; returns its detach. */
   attach: (client: HermesGateway) => () => void
-  /** Make `client` this window's primary: bind it, republish, announce it. */
-  promote: (client: HermesGateway, detach: () => void, conn: HermesConnection) => void
+  /**
+   * Make `client` this window's primary: bind it, republish, announce it.
+   * Returns the REPLACED generation's detach — the wake module owns it, and
+   * runs it the moment that generation closes (listener lifetime equals
+   * socket lifetime: a kept replacement is kept SERVED, #95327).
+   */
+  promote: (client: HermesGateway, detach: () => void, conn: HermesConnection) => () => void
   /** Resolve the primary route and mint its ticket; null when a newer route owns the socket. */
   resolveRoute: () => Promise<null | WakeRoute>
   /** Dial in place, for a signal with no socket to protect. */
@@ -79,10 +92,11 @@ export interface WakeHost {
 export interface WakeRecovery {
   /**
    * Wire the window's recovery signals to `signal` (the caller's "the primary
-   * ladder should stand down and dial again" step). Visibility changes park and
-   * unpark on the way through; returns one detach.
+   * ladder should stand down and dial again" step), which takes the signal's
+   * class (hard = the route's liveness is genuinely in question). Visibility
+   * changes park and unpark on the way through; returns one detach.
    */
-  bindSignals: (signal: () => void) => () => void
+  bindSignals: (signal: (hard: boolean) => void) => () => void
   /** Retire any replaced generation whose in-flight work has drained. */
   drain: () => void
   /** Close every socket this module kept alive and drop its subscriptions. */
@@ -91,21 +105,34 @@ export interface WakeRecovery {
   park: () => void
   /** Return: the routes are live again. Never dials by itself — the caller wakes. */
   unpark: () => void
-  /** One wake signal: dial once (single-flighted), sweep the pool once per holdoff. */
-  wake: () => void
+  /**
+   * One wake signal: sweep the pool once per holdoff, and dial the primary
+   * once (single-flighted). A SOFT signal (plain focus) leaves a primary that
+   * reports open alone — alt-tab must not churn a healthy socket; a HARD
+   * signal (return-from-park / online / power-resume) replaces one.
+   */
+  wake: (hard: boolean) => void
   /** The `'wake'` reconnect handler: dial a replacement generation. */
   dial: () => Promise<void>
 }
 
 export function createWakeRecovery(host: WakeHost): WakeRecovery {
   let lastForcedSweepAt = 0
-  /** Sockets a wake replaced but kept, because a turn was riding them. */
-  const replacedGenerations: HermesGateway[] = []
+  /**
+   * Sockets a wake replaced but kept, because a turn was riding them (#95327).
+   * Each entry carries the generation's app-listener detach: a kept socket is
+   * a SERVED socket — the running turn's deltas on it still reach the app,
+   * which is the whole point of keeping it — and the detach runs in the same
+   * breath as the close, never before.
+   */
+  const replacedGenerations: Array<{ client: HermesGateway; detach: () => void }> = []
 
   const closeReplaced = () => {
     for (const previous of replacedGenerations.splice(0)) {
+      previous.detach()
+
       try {
-        previous.close()
+        previous.client.close()
       } catch {
         // Already torn down by the backend or the OS.
       }
@@ -126,18 +153,19 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
   const offWorkDrained = $workingSessionIds.subscribe(drain)
 
   /**
-   * Retire a replaced socket now, or keep it until its work drains (#95327).
-   * The in-flight-work signal is read HERE, at the signal boundary: the dial
-   * that follows reconciles runtime bindings for the replaced socket, and that
-   * reconcile is not the turn ending.
+   * Retire a replaced socket now, or keep it (SERVED) until its work drains
+   * (#95327). The in-flight-work signal is read HERE, at the signal boundary:
+   * the dial that follows reconciles runtime bindings for the replaced socket,
+   * and that reconcile is not the turn ending.
    */
-  const retireReplaced = (previous: HermesGateway) => {
+  const retireReplaced = (previous: HermesGateway, detachPrevious: () => void) => {
     if (!shouldRetireReplacedSocket($workingSessionIds.get().length)) {
-      replacedGenerations.push(previous)
+      replacedGenerations.push({ client: previous, detach: detachPrevious })
 
       return
     }
 
+    detachPrevious()
     previous.close()
   }
 
@@ -180,6 +208,11 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
       }
 
       const successor = new HermesGateway()
+      // A CONTINUATION, not a cold boot (#C2a r2): share the replay cursors
+      // so this dial asks `session.events.since` for the window the old,
+      // half-open socket could not deliver. Must run before connect() — the
+      // open-time fetchReplay reads them.
+      successor.inheritReplayState(previous)
       const detach = host.attach(successor)
 
       try {
@@ -197,9 +230,9 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
         return
       }
 
-      host.promote(successor, detach, route.conn)
+      const detachPrevious = host.promote(successor, detach, route.conn)
       await host.finish(route.conn)
-      retireReplaced(previous)
+      retireReplaced(previous, detachPrevious)
     } catch (error) {
       // A stale ticket still has to surface once (it can never succeed); a
       // transport failure is not a lost connection — the live socket stays.
@@ -210,7 +243,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
   }
 
   return {
-    bindSignals: (signal: () => void) => {
+    bindSignals: (signal: (hard: boolean) => void) => {
       // A fresh bind RE-READS the document: the latch is a function of what the
       // window is doing, so a stale park (an editor reload while hidden, a mount
       // that missed the event) can never latch a visible window's ladders off.
@@ -220,13 +253,19 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
         unparkSecondaryReconnects()
       }
 
-      const onOnline = () => signal()
-      const onFocus = () => signal()
+      // HARD = the route's liveness is genuinely in question: a network that
+      // came back, or the return from a park (becoming visible IS coming back
+      // from hidden — the latch went up on the way out). SOFT = the window
+      // merely regained focus: an alt-tab says nothing about the socket, and
+      // replacing an open one on it is a mint + churn per tab-switch (#94769
+      // on the primary) — a soft signal redials only a non-open primary.
+      const onOnline = () => signal(true)
+      const onFocus = () => signal(false)
 
       const onVisible = () => {
         if (document.visibilityState === 'visible') {
           unparkSecondaryReconnects()
-          signal()
+          signal(true)
 
           return
         }
@@ -252,12 +291,20 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
     },
     park: parkSecondaryReconnects,
     unpark: unparkSecondaryReconnects,
-    wake: () => {
+    wake: (hard: boolean) => {
       if (!host.ready() || secondaryReconnectsParked()) {
         return
       }
 
       reconnectSecondaryGateways(sweep())
+
+      if (!hard && host.primary().connectionState === 'open') {
+        // Focus on a socket that reports open: nothing this signal knows says
+        // the transport moved. A genuinely half-open one dies on its own when
+        // the heartbeat deadline runs — the ladder, not the alt-tab, rebuilds it.
+        return
+      }
+
       // Single-flight: a burst of wake signals (macOS resume + unlock + a
       // network change, seconds apart) joins ONE dial instead of stacking
       // replacement sockets.
