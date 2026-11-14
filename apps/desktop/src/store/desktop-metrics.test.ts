@@ -15,6 +15,7 @@ import {
   noteBackendExited,
   noteInteraction,
   noteMessageSent,
+  noteParkedClose,
   noteReconnectDetection,
   noteReconnectPreIpc,
   noteReconnectSocketPhases,
@@ -657,5 +658,82 @@ describe('reconnect episode (C1, t_c1f387b2)', () => {
     // C2a reads close_reason to tell a wake nudge from the user hitting Reconnect.
     expect(reconnectCloseReason(false)).toBe('wake')
     expect(reconnectCloseReason(true)).toBe('manual')
+  })
+
+  // ── the park edge (t_de06ee1e) ───────────────────────────────────────────────
+  // Parked time is never inside an episode: a park ends the wait its user was in
+  // the middle of (no friction — nobody waited out the redial it cancelled) and
+  // the redial the RETURN does is a cold dial of a primary that died unwatched,
+  // which is what QA reads parked_close for.
+
+  it('a park settles the open episode as parked, and the return dial reports parked_close', async () => {
+    const { calls, request } = requester()
+
+    setDesktopMetricsGate('on')
+    bindDesktopMetrics(request)
+    const logged = logLines()
+
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'visible' })
+    vi.setSystemTime(DAY1 + 400)
+    noteReconnectDetection()
+    vi.setSystemTime(DAY1 + 900)
+    settleReconnectEpisode('parked') // the user left before the backoff's redial
+
+    expect(logged).toHaveBeenCalledTimes(1)
+
+    const parked = String(logged.mock.calls[0]?.[0] ?? '')
+
+    expect(parked).toContain('outcome=parked')
+    expect(parked).toContain('detect_ms=400')
+    expect(parked).toContain('total_ms=n/a')
+    // The parked line describes the cancelled wait, not the return's dial.
+    expect(parked).toContain('parked_close=no')
+
+    await flush()
+    expect(calls.filter(([m]) => m === 'shared_metrics.desktop_friction')).toEqual([])
+
+    // The user comes back: the redial is a cold dial of what the park left dead.
+    vi.setSystemTime(DAY1 + 600_000)
+    beginReconnectEpisode({ closeReason: 'wake', visibilityAtClose: 'visible' })
+    noteReconnectDetection()
+    vi.setSystemTime(DAY1 + 600_030)
+    noteReconnectSocketPhases(socketPhases())
+
+    const returning = String(logged.mock.calls[1]?.[0] ?? '')
+
+    expect(returning).toContain('outcome=usable')
+    expect(returning).toContain('close_reason=wake')
+    expect(returning).toContain('detect_ms=0')
+    expect(returning).toContain('parked_close=yes')
+
+    await flush()
+    expect(calls.filter(([m]) => m === 'shared_metrics.desktop_friction').map(([, p]) => p.detail)).toEqual(['lt_1s'])
+  })
+
+  it('a park with nothing open writes nothing and leaves no mark on the next episode', () => {
+    const logged = logLines()
+
+    settleReconnectEpisode('parked')
+
+    expect(logged).not.toHaveBeenCalled()
+
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'visible' })
+    settleReconnectEpisode('abandoned')
+
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('parked_close=no')
+  })
+
+  it('a close that landed while parked tags the return dial once, then is forgotten', () => {
+    const logged = logLines()
+
+    noteParkedClose() // the onState guard suppressed this close's episode
+    beginReconnectEpisode({ closeReason: 'wake', visibilityAtClose: 'visible' })
+    settleReconnectEpisode('abandoned')
+
+    beginReconnectEpisode({ closeReason: 'network', visibilityAtClose: 'visible' })
+    settleReconnectEpisode('abandoned')
+
+    expect(String(logged.mock.calls[0]?.[0] ?? '')).toContain('parked_close=yes')
+    expect(String(logged.mock.calls[1]?.[0] ?? '')).toContain('parked_close=no')
   })
 })

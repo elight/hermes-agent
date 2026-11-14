@@ -48,7 +48,7 @@
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { shouldRetireReplacedSocket } from '@/lib/gateway-liveness-policy'
-import { ensureReconnectEpisode, noteReconnectDetection } from '@/store/desktop-metrics'
+import { ensureReconnectEpisode, noteReconnectDetection, settleReconnectEpisode } from '@/store/desktop-metrics'
 import { reconnectSecondaryGateways } from '@/store/gateway'
 import {
   parkSecondaryReconnects,
@@ -178,6 +178,19 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
     previous.close()
   }
 
+  /**
+   * Park, and end any wait the user was in the middle of. A close that landed
+   * while the window was VISIBLE opened the episode its user is waiting on; a
+   * park that beats that redial means the wait is over — nobody is waiting any
+   * more, and the parked time must never land inside the next episode's clock.
+   * The return's dial redials what the park left behind (a primary nobody
+   * watched die), which the next episode reports as `parked_close`.
+   */
+  const park = () => {
+    parkSecondaryReconnects()
+    settleReconnectEpisode('parked')
+  }
+
   const dial = async (): Promise<void> => {
     if (!host.ready() || secondaryReconnectsParked()) {
       return
@@ -198,10 +211,28 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
     ensureReconnectEpisode({ closeReason: 'wake', visibilityAtClose: windowVisibility() })
     noteReconnectDetection()
 
+    // The episode opened above describes THIS dial's replacement. Up to the
+    // promote, the live primary is still the one this wake meant to replace, so
+    // an abandoned dial here must end its own episode — left open, the next
+    // unrelated usable/begin would settle it on a clock that is not its own.
+    let promoted = false
+
+    const abandonEpisode = () => {
+      if (!promoted && host.primary().connectionState === 'open') {
+        settleReconnectEpisode('abandoned')
+      }
+    }
+
     try {
       const route = await host.resolveRoute()
 
       if (!route) {
+        // No route this dial may touch (its contract: null when a newer
+        // boot/apply owns the socket, or the window is going away). The episode
+        // above is THIS dial's — end it on its own clock like every other exit
+        // here; left open, the next unrelated usable/begin would settle it.
+        abandonEpisode()
+
         return
       }
 
@@ -224,17 +255,21 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
       if (!host.ready() || successor.connectionState !== 'open') {
         detach()
         successor.close()
+        abandonEpisode()
 
         return
       }
 
       const detachPrevious = host.promote(successor, detach, route.conn)
+
+      promoted = true
       await host.finish(route.conn)
       retireReplaced(previous, detachPrevious)
     } catch (error) {
       // A stale ticket still has to surface once (it can never succeed); a
       // transport failure is not a lost connection — the live socket stays.
       host.noteReauth(error)
+      abandonEpisode()
     } finally {
       drain()
     }
@@ -246,7 +281,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
       // window is doing, so a stale park (an editor reload while hidden, a mount
       // that missed the event) can never latch a visible window's ladders off.
       if (document.visibilityState === 'hidden') {
-        parkSecondaryReconnects()
+        park()
       } else {
         unparkSecondaryReconnects()
       }
@@ -268,7 +303,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
           return
         }
 
-        parkSecondaryReconnects()
+        park()
       }
 
       window.addEventListener('online', onOnline)
@@ -288,7 +323,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
       offPoolRoute()
       closeReplaced()
     },
-    park: parkSecondaryReconnects,
+    park,
     unpark: unparkSecondaryReconnects,
     wake: (hard: boolean) => {
       if (!host.ready() || secondaryReconnectsParked()) {

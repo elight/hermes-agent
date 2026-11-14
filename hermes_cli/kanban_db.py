@@ -1858,13 +1858,12 @@ def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
 ) -> Optional[int]:
-    """Close the active run (``status`` defaults to ``outcome``) and clear
-    ``current_run_id``; None when no run was active (never-claimed task).
-
-    ``worker_pid`` / ``worker_started_at`` / ``claim_lock`` stay on the closed
-    row: they are the only evidence left of the OS process once the task row
-    is wiped, and :func:`kanban_db_dispatch.reap_terminal_workers` needs them
-    to end a worker that survived its own terminal transition."""
+    """Close the active run (``status`` defaults to ``outcome``); clears
+    ``current_run_id`` and, on a successful handoff, the failure text that
+    handoff superseded (:func:`kanban_db_failure_text.retire_superseded_failure`).
+    None when no run was active. ``worker_pid``/``worker_started_at``/``claim_lock``
+    stay on the closed row: the only evidence of the OS process once the task row
+    is wiped, and what :func:`~kanban_db_dispatch.reap_terminal_workers` reaps by."""
     now = int(time.time())
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
@@ -1884,7 +1883,7 @@ def _end_run(
         """,
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
-    conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    retire_superseded_failure(conn, task_id, outcome)
     return run_id
 
 
@@ -4229,3 +4228,4 @@ from hermes_cli.kanban_db_dispatch import (
     _worker_survived_termination,
     _worker_terminal_timeout_env,
 )
+from hermes_cli.kanban_db_failure_text import retire_superseded_failure

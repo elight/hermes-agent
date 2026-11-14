@@ -663,6 +663,8 @@ export function reconnectCloseReason(manual: boolean): ReconnectCloseReason {
 interface ReconnectEpisode {
   closeReason: ReconnectCloseReason
   detectDoneAt: number | null
+  /** The return dial for a close nobody watched (see `noteParkedClose`). */
+  parkedClose: boolean
   preIpcDoneAt: number | null
   socketPhases: GatewaySocketPhases | null
   startedAt: number
@@ -670,6 +672,20 @@ interface ReconnectEpisode {
 }
 
 let reconnectEpisode: ReconnectEpisode | null = null
+
+/**
+ * A drop nobody watched is waiting for its redial: the close landed while the
+ * window was parked (the park guard suppresses its episode) or it opened one
+ * that the park afterwards settled. Either way the NEXT episode is the return's
+ * cold redial of what the park left behind — not a replacement of a live
+ * half-open primary — and says so (`parked_close=yes`). Consumed by the next
+ * `beginReconnectEpisode`.
+ */
+let parkedClose = false
+
+export function noteParkedClose(): void {
+  parkedClose = true
+}
 
 /** Start the clock for a new episode; a previous one that never landed settles as `retrying`. */
 export function beginReconnectEpisode(
@@ -683,11 +699,14 @@ export function beginReconnectEpisode(
   reconnectEpisode = {
     closeReason: init.closeReason,
     detectDoneAt: null,
+    parkedClose,
     preIpcDoneAt: null,
     socketPhases: null,
     startedAt: now,
     visibilityAtClose: init.visibilityAtClose
   }
+
+  parkedClose = false
 }
 
 /** Begin only when no episode is already open (a wake nudge after a silent drop). */
@@ -742,13 +761,23 @@ export function noteReconnectSocketPhases(phases: GatewaySocketPhases): void {
 }
 
 /** Write the episode's log line and its one friction record; no-op when none is open. */
-export function settleReconnectEpisode(outcome: 'abandoned' | 'retrying' | 'usable', now = Date.now()): void {
+export function settleReconnectEpisode(outcome: 'abandoned' | 'parked' | 'retrying' | 'usable', now = Date.now()): void {
   const episode = reconnectEpisode
 
   reconnectEpisode = null
 
   if (!episode) {
     return
+  }
+
+  // A park ends the wait the user was in the middle of: nobody waited out the
+  // redial it cancelled, so the park files NO friction record — and the dial the
+  // return does is a cold redial of a primary that died unwatched, which the
+  // next episode reports (parked_close).
+  const parked = outcome === 'parked'
+
+  if (parked) {
+    parkedClose = true
   }
 
   const detectMs = episode.detectDoneAt === null ? null : episode.detectDoneAt - episode.startedAt
@@ -767,13 +796,16 @@ export function settleReconnectEpisode(outcome: 'abandoned' | 'retrying' | 'usab
       `reconnect-episode detect_ms=${num(detectMs)} pre_ipc_ms=${num(preIpcMs)} dial_ms=${num(phases?.dial_ms ?? null)} ` +
         `ready_ms=${num(phases?.ready_ms ?? null)} replay_barrier_ms=${num(phases?.replay_barrier_ms ?? null)} ` +
         `usable_ms=${num(phases?.usable_ms ?? null)} total_ms=${num(totalMs)} outcome=${outcome} ` +
-        `close_reason=${episode.closeReason} visibility_at_close=${episode.visibilityAtClose}`
+        `close_reason=${episode.closeReason} visibility_at_close=${episode.visibilityAtClose} ` +
+        `parked_close=${episode.parkedClose ? 'yes' : 'no'}`
     )
   } catch {
     // Telemetry never surfaces; the log bridge may be an older shell.
   }
 
-  recordFriction('reconnect_episode', totalMs === null ? 'failed' : reconnectTotalBucket(totalMs))
+  if (!parked) {
+    recordFriction('reconnect_episode', totalMs === null ? 'failed' : reconnectTotalBucket(totalMs))
+  }
 }
 
 export function recordFriction(kind: DesktopFrictionKind, detail: DesktopFrictionDetail): void {
@@ -1081,6 +1113,7 @@ function forgetInMemory(): void {
   recentClicks.clear()
   cancelPendingBackendDrop()
   reconnectEpisode = null
+  parkedClose = false
 }
 
 /** Apply the focused profile's collection switch. Off purges everything local. `decided` false
@@ -1151,6 +1184,7 @@ export function resetDesktopMetricsForTests(): void {
   recentClicks.clear()
   cancelPendingBackendDrop()
   reconnectEpisode = null
+  parkedClose = false
   lastBackendExitAt = 0
   $desktopMetricsGate.set(null)
 }
