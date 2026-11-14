@@ -56,6 +56,7 @@ import {
   unparkSecondaryReconnects
 } from '@/store/gateway-park'
 import { registerGatewayPoolRoute, superviseWake } from '@/store/gateway-supervisor'
+import { reconnectResumeGate } from '@/store/reconnect-resume'
 import { $workingSessionIds } from '@/store/session-states'
 
 export interface WakeRoute {
@@ -204,7 +205,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
         return
       }
 
-      const successor = new HermesGateway()
+      const successor = new HermesGateway({ beforeOpenRequests: reconnectResumeGate })
       // A CONTINUATION, not a cold boot (#C2a r2): share the replay cursors
       // so this dial asks `session.events.since` for the window the old,
       // half-open socket could not deliver. Must run before connect() — the

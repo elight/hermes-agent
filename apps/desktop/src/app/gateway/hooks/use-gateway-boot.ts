@@ -89,6 +89,10 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
+import {
+  beginReconnectResumeOnSocket,
+  reconnectResumeGate
+} from '@/store/reconnect-resume'
 import { requestBackendRestart } from '@/store/recovery-requests'
 import {
   $activeSessionId,
@@ -571,11 +575,9 @@ export function useGatewayBoot({
       manual?: { profile: string; activationEpoch: number },
       { keepTurnClaims = false }: { keepTurnClaims?: boolean } = {}
     ) => {
-      // A respawned backend re-mints (recycles) runtime ids, so any tile's
-      // bound runtime id is now stale — drop them so each tile re-resumes.
-      // A legacy remote primary has no registry identity to scope by; fall
-      // back to preserving only Bot runtimes owned by provably-live
-      // secondaries so the restarted backend's own tiles still rebind.
+      // A respawned backend re-mints (recycles) runtime ids, so any tile's bound runtime id is now
+      // stale — drop them so each tile re-resumes. A legacy remote primary has no registry identity
+      // to scope by; fall back to live secondaries so the restarted backend's own tiles still rebind.
       const primaryConnectionId = primaryRuntimeConnectionId(conn)
       resetTileRuntimeBindings(
         manual && primaryConnectionId
@@ -588,11 +590,11 @@ export function useGatewayBoot({
       // the same lifetime as the runtime bindings it shadows.
       resetBackgroundPollingGuard()
 
-      // Same staleness, other half: pre-reconnect busy flags are keyed by
-      // those dead runtime ids and would never receive their terminal
-      // busy:false — clear them or the sidebar running arc lies forever
-      // (#53902/#73082). A genuinely live turn re-asserts busy on its next
-      // post-reconnect event.
+      // #C6: the socket is back, the runtimes behind it are not
+      beginReconnectResumeOnSocket()
+
+      // Same staleness, other half: pre-reconnect busy flags are keyed by those dead runtime ids and
+      // would never receive their terminal busy:false (#53902/#73082); a live turn re-asserts it.
       // A manual retry may finish after the user has moved to another route.
       if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
         if (!keepTurnClaims) {
@@ -1076,8 +1078,9 @@ export function useGatewayBoot({
     // `let`: the wake path REPLACES the primary generation in place (#C2a,
     // adoptPrimaryGeneration), and every closure below must keep reading the
     // CURRENT primary — that is what keeps one window owned by exactly one live
-    // socket across a wake.
-    let gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    // socket across a wake. Every primary generation installs the #C6 gate that
+    // holds replayed open_requests until this reconnect's re-resumes are out.
+    let gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway({ beforeOpenRequests: reconnectResumeGate })
 
     // Every socket this window owns (the primary below, every registry
     // secondary via onEvent) funnels through this one gate before any store
