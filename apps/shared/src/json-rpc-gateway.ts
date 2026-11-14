@@ -649,6 +649,27 @@ export class JsonRpcGatewayClient {
   }
 
   /**
+   * Continue `from`'s connection instead of cold-booting over it (#C2a wake).
+   * The replay cursors are per-instance, so a successor that never inherited
+   * them never asks for the window between the old socket's death and the new
+   * dial — every event in it is simply lost. The cursor maps are SHARED, not
+   * copied: one watermark governs both generations, so whichever socket
+   * delivers a frame first advances it and the other generation's copy is
+   * dropped — here, by the replay gate's watermark check — and again at the
+   * app's cross-socket dedupe. Call before `connect()`: the open-time
+   * `fetchReplay()` reads the cursors this adopts.
+   */
+  inheritReplayState(from: JsonRpcGatewayClient): void {
+    if (from === this) {
+      return
+    }
+
+    this.lastSeenSeq = from.lastSeenSeq
+    this.replayEpochBySession = from.replayEpochBySession
+    this.replayEpoch = from.replayEpoch
+  }
+
+  /**
    * Wait for this session's reconnect replay AND parked live frames to dispatch.
    * True includes bounded timeout/unsupported-method fallback and an epoch
    * change on the still-open socket (backend restart: nothing will replay, so

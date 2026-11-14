@@ -620,7 +620,7 @@ async function openSecondary(entry: Secondary): Promise<void> {
     throw reauthError
   }
 
-  if (!desktop) {
+  if (!desktop || g.config?.routesParked?.()) {
     return
   }
 
@@ -857,7 +857,7 @@ async function openSecondaryForRequest(entry: Secondary, spawnPriority: SpawnPri
 }
 
 function scheduleReconnect(entry: Secondary): void {
-  if (entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
+  if (g.config?.routesParked?.() || entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
     return
   }
 

@@ -4,7 +4,6 @@ import {
   isGatewayWebSocketUrl,
   isStableOpen,
   JSON_RPC_METHOD_NOT_FOUND,
-  JsonRpcGatewayError,
   reconnectBackoffDelayMs
 } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
@@ -18,9 +17,7 @@ import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd } from '@/lib/desktop-fs'
 import {
-  decideLivenessForceClose,
-  LIVENESS_REPROBE_DELAY_MS,
-  probeGatewayLiveness
+  LIVENESS_REPROBE_DELAY_MS
 } from '@/lib/gateway-liveness-policy'
 import { resolveDesktopGatewayWsUrl } from '@/lib/gateway-ws-url'
 import { hostHas } from '@/lib/host-capabilities'
@@ -62,13 +59,12 @@ import {
   gatewayActivationEpoch,
   isActivePrimary,
   liveSecondaryConnectionIds,
-  pruneSecondaryGateways,
-  reconnectSecondaryGateways,
   reportPrimaryGatewayState,
   type ScopedServerRequest,
   setPrimaryGateway,
   setPrimaryGatewayConnection
 } from '@/store/gateway'
+import { secondaryReconnectsParked } from '@/store/gateway-park'
 import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
 import { type GatewayReconnectOptions, reconnectGateway, registerGatewayReconnect } from '@/store/gateway-reconnect'
 import {
@@ -93,8 +89,6 @@ import {
   $connection,
   $currentCwd,
   $gatewayState,
-  $selectedStoredSessionId,
-  $sessions,
   ensureDefaultWorkspaceCwd,
   forgetSessionOwnerHintsForConnection,
   setConnection,
@@ -104,14 +98,8 @@ import {
 } from '@/store/session'
 import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
 import {
-  $attentionSessionIds,
-  $sessionOwnerHoldRevision,
-  $sessionTiles,
-  $workingSessionIds,
   foregroundSessionScopes,
   forgetProfileOnlyRuntimeOwners,
-  liveSessionScopes,
-  openTileGatewayScopes,
   reconcileBusyStatesOnReconnect,
   recordSessionEventScope,
   resetTileRuntimeBindings
@@ -120,9 +108,12 @@ import { warnIfTerminalBackendUnavailable } from '@/store/terminal-backend-warni
 import { isPeerInstanceWindow, windowProfileOverride } from '@/store/windows'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
+import { bindKeptGatewayRecompute, liveWorkScopes } from './gateway-keepset'
+import { createPrimaryLivenessProbe } from './primary-liveness-probe'
 import { notifyPrimaryReauth } from './primary-reauth-notice'
 import { useConnectionsRegistry } from './use-connections-registry'
 import { useDefaultProfilePreference } from './use-default-profile-preference'
+import { createWakeRecovery } from './use-gateway-boot-wake'
 
 // After the reconnect loop has been failing for this long, raise a NON-blocking
 // warning toast. Full-screen BootFailureOverlay used to lock the user out of
@@ -145,9 +136,14 @@ const RECONNECT_ESCALATE_AFTER_MS = 300_000
 // turn is in flight the first timeout defers behind one bounded re-probe, so
 // only a STREAK of unanswered pings rebuilds the transport.
 
-// Renderer twin of the main process's POWER_RESUME_REVALIDATION_HOLDOFF_MS:
-// forced wake reconnects (online / power resume) are coalesced into one per
-// window instead of tearing down every secondary socket on each signal (#94769).
+// Renderer twin of the main process's POWER_RESUME_REVALIDATION_HOLDOFF_MS,
+// and — like it — a holdoff on DESTRUCTION only (#C2a). Wake signals are
+// frequent and overlapping (macOS fires resume then 'online' seconds apart;
+// Windows fires 'online' on any interface change), and each one used to be
+// allowed to close every open secondary socket: the #94769 flicker loop.
+// Coalescing that sweep is the whole job of this constant. The cheap half of a
+// wake — mint + dial a replacement primary — is idempotent and single-flights
+// in store/gateway-reconnect, so it is deliberately NOT gated by this.
 const WAKE_RECONNECT_HOLDOFF_MS = 15_000
 
 // Bounded self-heal for a failed REMOTE boot (#82679): main classifies every
@@ -480,26 +476,136 @@ export function useGatewayBoot({
       }
     }
 
-    const clearLivenessReprobeTimer = () => {
-      if (livenessReprobeTimer !== null) {
-        clearTimeout(livenessReprobeTimer)
-        livenessReprobeTimer = null
+    // The #95327 probe (streak, bounded re-probe, decision) lives in
+    // ./primary-liveness-probe; `ready` carries the park latch.
+    const probe = createPrimaryLivenessProbe({
+      ready: () => !cancelled && bootCompleted && !$gatewaySwitching.get() && !secondaryReconnectsParked(),
+      primary: () => gateway,
+      closeAsTimeout: () => {
+        ownCloseReason = 'timeout'
+        gateway.close()
+      },
+      reprobeDelayMs: LIVENESS_REPROBE_DELAY_MS
+    })
+
+    // Resolve the primary route and mint its ticket; `null` when a newer
+    // boot/connection apply owns the socket (the caller must not touch it).
+    const resolvePrimaryRoute = async (): Promise<null | { conn: HermesConnection; wsUrl: string }> => {
+      // Drop a stale REMOTE backend cache before re-dialing. After sleep/wake a
+      // remote backend can become unreachable, but it has no child process
+      // whose 'exit' would clear the main process's cached descriptor — without
+      // this the renderer re-dials the same dead endpoint forever and stays on
+      // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
+      // Bounded like the two awaits below: a wedged revalidation (#93454) is
+      // the specific hang this loop must survive, not just a rejection.
+      await withTimeout(
+        desktop.revalidateConnection?.() ?? Promise.resolve(),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        'Timed out revalidating the gateway connection'
+      ).catch(() => undefined)
+
+      // Reconnect the socket's own route, not main's mutable foreground route.
+      // Profile-less resolution remains intentional for boot/connection apply.
+      // A registry primary needs both identity fields; a legacy primary uses
+      // its explicit profile so a foreground secondary cannot retarget it.
+      const lookupRevision = primaryRouteRevision
+
+      const conn = await withTimeout(
+        primaryConnection?.registryScoped && primaryConnection.connectionId
+          ? (desktop.getConnectionFor?.({
+              connectionId: primaryConnection.connectionId,
+              profile: primaryConnection.profile
+            }) ?? Promise.reject(new Error('Registry gateway connection is unavailable')))
+          : desktop.getConnection(primaryConnection?.profile),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        'Timed out reconnecting to Hermes backend'
+      )
+
+      // A boot/connection apply that recorded a newer primary route during
+      // the lookup owns the socket; recording, publishing or dialing the old
+      // route would undo it and pin later reconnects to the old gateway.
+      if (cancelled || lookupRevision !== primaryRouteRevision) {
+        return null
       }
+
+      recordPrimaryConnection(conn)
+      const dialRevision = primaryRouteRevision
+
+      // Only publish the primary descriptor when the primary is active.
+      // Otherwise a background-profile view would inherit the primary's
+      // mode/baseUrl and break image.attach / fs / media routing (#46651).
+      if (isActivePrimary()) {
+        publish(conn)
+      }
+
+      // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
+      // with a short TTL, so the ticket baked into the cached conn.wsUrl is
+      // dead on every reconnect after the initial boot — reusing it surfaces
+      // as an opaque "Could not connect to Hermes gateway". resolveGatewayWsUrl
+      // mints a fresh ticket rather than connecting with a stale one. An
+      // explicit auth rejection asks for sign-in; transport failures stay in
+      // this reconnect loop. For local/token gateways the URL carries a
+      // long-lived token and the re-mint is a cheap no-op.
+      const wsUrl = await withTimeout(
+        resolveDesktopGatewayWsUrl(desktop, conn),
+        RECONNECT_ATTEMPT_TIMEOUT_MS,
+        'Timed out re-minting the gateway WebSocket URL'
+      )
+
+      // Same fence after the mint: an apply that landed while the ticket was
+      // in flight owns the socket, and its socket may already have dropped.
+      if (cancelled || dialRevision !== primaryRouteRevision) {
+        return null
+      }
+
+      // C1: revalidate + connection lookup + ticket mint are the serial pre-IPC leg;
+      // its end is where the dial clock starts.
+      noteReconnectPreIpc()
+
+      return { conn, wsUrl }
     }
 
-    // One bounded retry before a mid-turn teardown: the first probe timeout
-    // while work is in flight is inconclusive (a busy backend starves the
-    // loop without being dead), so re-probe once after a short delay instead
-    // of force-closing a socket a running turn still rides on (#95327).
-    const scheduleLivenessReprobe = () => {
-      if (cancelled || livenessReprobeTimer !== null || $gatewaySwitching.get()) {
-        return
-      }
+    // Everything every dial shape owes once its socket is open (#C3 owns
+    // unhanding the two list refreshes). `keepTurnClaims`: a drop may have taken
+    // the backend's runtimes with it so its stale busy claims are retired
+    // (#53902/#73082); the wake path's REPLACEMENT leaves a live turn where it
+    // is, so its claims must survive the socket swap (#C2a).
+    const finishPrimaryConnect = async (
+      conn: HermesConnection,
+      manual?: { profile: string; activationEpoch: number },
+      { keepTurnClaims = false }: { keepTurnClaims?: boolean } = {}
+    ) => {
+      // A respawned backend re-mints (recycles) runtime ids, so any tile's
+      // bound runtime id is now stale — drop them so each tile re-resumes.
+      // A legacy remote primary has no registry identity to scope by; fall
+      // back to preserving only Bot runtimes owned by provably-live
+      // secondaries so the restarted backend's own tiles still rebind.
+      const primaryConnectionId = primaryRuntimeConnectionId(conn)
+      resetTileRuntimeBindings(
+        manual && primaryConnectionId
+          ? { connectionId: primaryConnectionId, profile: manual.profile }
+          : (primaryConnectionId ?? { liveConnectionIds: liveSecondaryConnectionIds() })
+      )
+      // The status-stack poll guard latches session ids the OLD runtime
+      // reported gone (4001). A respawned backend re-mints runtimes, so
+      // those ids may be live again after re-resume — clear the latch with
+      // the same lifetime as the runtime bindings it shadows.
+      resetBackgroundPollingGuard()
 
-      livenessReprobeTimer = setTimeout(() => {
-        livenessReprobeTimer = null
-        void reconnectNow()
-      }, LIVENESS_REPROBE_DELAY_MS)
+      // Same staleness, other half: pre-reconnect busy flags are keyed by
+      // those dead runtime ids and would never receive their terminal
+      // busy:false — clear them or the sidebar running arc lies forever
+      // (#53902/#73082). A genuinely live turn re-asserts busy on its next
+      // post-reconnect event.
+      // A manual retry may finish after the user has moved to another route.
+      if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
+        if (!keepTurnClaims) {
+          reconcileBusyStatesOnReconnect()
+        }
+
+        await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
+        await callbacksRef.current.refreshSessions().catch(() => undefined)
+      }
     }
 
     const attemptReconnect = async (manual?: { profile: string; activationEpoch: number }) => {
@@ -520,123 +626,21 @@ export function useGatewayBoot({
       noteReconnectDetection()
 
       try {
-        // Drop a stale REMOTE backend cache before re-dialing. After sleep/wake a
-        // remote backend can become unreachable, but it has no child process
-        // whose 'exit' would clear the main process's cached descriptor — without
-        // this the renderer re-dials the same dead endpoint forever and stays on
-        // "Starting Hermes…". The probe is a no-op for a healthy or local backend.
-        // Bounded like the two awaits below: a wedged revalidation (#93454) is
-        // the specific hang this loop must survive, not just a rejection.
-        await withTimeout(
-          desktop.revalidateConnection?.() ?? Promise.resolve(),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out revalidating the gateway connection'
-        ).catch(() => undefined)
+        const route = await resolvePrimaryRoute()
 
-        // Reconnect the socket's own route, not main's mutable foreground route.
-        // Profile-less resolution remains intentional for boot/connection apply.
-        // A registry primary needs both identity fields; a legacy primary uses
-        // its explicit profile so a foreground secondary cannot retarget it.
-        const lookupRevision = primaryRouteRevision
-
-        const conn = await withTimeout(
-          primaryConnection?.registryScoped && primaryConnection.connectionId
-            ? (desktop.getConnectionFor?.({
-                connectionId: primaryConnection.connectionId,
-                profile: primaryConnection.profile
-              }) ?? Promise.reject(new Error('Registry gateway connection is unavailable')))
-            : desktop.getConnection(primaryConnection?.profile),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out reconnecting to Hermes backend'
-        )
-
-        // A boot/connection apply that recorded a newer primary route during
-        // the lookup owns the socket; recording, publishing or dialing the old
-        // route would undo it and pin later reconnects to the old gateway.
-        if (cancelled || lookupRevision !== primaryRouteRevision) {
+        if (!route) {
           return
         }
 
-        recordPrimaryConnection(conn)
-        const dialRevision = primaryRouteRevision
-
-        // Only publish the primary descriptor when the primary is active.
-        // Otherwise a background-profile view would inherit the primary's
-        // mode/baseUrl and break image.attach / fs / media routing (#46651).
-        if (isActivePrimary()) {
-          publish(conn)
-        }
-
-        // Re-mint the WS URL before reconnecting. OAuth tickets are single-use
-        // with a short TTL, so the ticket baked into the cached conn.wsUrl is
-        // dead on every reconnect after the initial boot — reusing it surfaces
-        // as an opaque "Could not connect to Hermes gateway". resolveGatewayWsUrl
-        // mints a fresh ticket rather than connecting with a stale one. An
-        // explicit auth rejection asks for sign-in; transport failures stay in
-        // this reconnect loop. For local/token gateways the URL carries a
-        // long-lived token and the re-mint is a cheap no-op.
-        const wsUrl = await withTimeout(
-          resolveDesktopGatewayWsUrl(desktop, conn),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out re-minting the gateway WebSocket URL'
-        )
-
-        // Same fence after the mint: an apply that landed while the ticket was
-        // in flight owns the socket, and its socket may already have dropped.
-        if (cancelled || dialRevision !== primaryRouteRevision) {
-          return
-        }
-
-        // C1: revalidate + connection lookup + ticket mint are the serial pre-IPC leg;
-        // its end is where the dial clock starts.
-        noteReconnectPreIpc()
-
-        await gateway.connect(wsUrl)
+        await gateway.connect(route.wsUrl)
 
         if (cancelled) {
           return
         }
 
-        // A respawned backend re-mints (recycles) runtime ids, so any tile's
-        // bound runtime id is now stale — drop them so each tile re-resumes.
-        // A legacy remote primary has no registry identity to scope by; fall
-        // back to preserving only Bot runtimes owned by provably-live
-        // secondaries so the restarted backend's own tiles still rebind.
-        const primaryConnectionId = primaryRuntimeConnectionId(conn)
-        resetTileRuntimeBindings(
-          manual && primaryConnectionId
-            ? { connectionId: primaryConnectionId, profile: manual.profile }
-            : (primaryConnectionId ?? { liveConnectionIds: liveSecondaryConnectionIds() })
-        )
-        // The status-stack poll guard latches session ids the OLD runtime
-        // reported gone (4001). A respawned backend re-mints runtimes, so
-        // those ids may be live again after re-resume — clear the latch with
-        // the same lifetime as the runtime bindings it shadows.
-        resetBackgroundPollingGuard()
-
-        // Same staleness, other half: pre-reconnect busy flags are keyed by
-        // those dead runtime ids and would never receive their terminal
-        // busy:false — clear them or the sidebar running arc lies forever
-        // (#53902/#73082). A genuinely live turn re-asserts busy on its next
-        // post-reconnect event.
-        // A manual retry may finish after the user has moved to another route.
-        if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
-          reconcileBusyStatesOnReconnect()
-          await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
-          await callbacksRef.current.refreshSessions().catch(() => undefined)
-        }
+        await finishPrimaryConnect(route.conn, manual)
       } catch (err) {
-        // OAuth session expired mid-reconnect: surface the actionable "sign in
-        // again" recovery overlay once instead of silently looping the backoff
-        // against a ticket that can never succeed. Transport failures fall
-        // through to the backoff in the finally block below — they must NOT
-        // take the full-screen "couldn't start" path (locks reading/drafting).
-        if (!cancelled && isGatewayReauthRequired(err) && !reauthNotified) {
-          primaryReauthError = err instanceof Error ? err.message : String(err)
-          syncPrimaryReauthError()
-          reauthNotified = true
-          notifyPrimaryReauth(primaryReauthError, () => primaryReauthError ?? '')
-        }
+        notePrimaryReauth(err)
       } finally {
         reconnecting = false
 
@@ -670,6 +674,7 @@ export function useGatewayBoot({
     function scheduleReconnect(manual?: { profile: string; activationEpoch: number }) {
       if (
         cancelled ||
+        secondaryReconnectsParked() ||
         primaryReauthError ||
         reconnecting ||
         reconnectTimer !== null ||
@@ -687,80 +692,64 @@ export function useGatewayBoot({
       reconnectAttempt += 1
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null
-        void attemptReconnect(manual)
+
+        // Armed before the park (#C2a): a hidden window dials no replacement.
+        if (!secondaryReconnectsParked()) {
+          void attemptReconnect(manual)
+        }
       }, delay)
     }
 
-    const reconnectNow = async ({ forceOpenSocket = false }: { forceOpenSocket?: boolean } = {}) => {
-      if (cancelled || !bootCompleted || $gatewaySwitching.get()) {
-        return
-      }
-
-      clearReconnectTimer()
-      resetReconnectBackoff()
-      reconnectSecondaryGateways({ forceOpenSockets: forceOpenSocket })
-
-      // Browser WebSocket state can remain OPEN after sleep even though the OS
-      // discarded the underlying TCP connection. Strong recovery signals used
-      // to blind-close here, but that churned perfectly healthy connections on
-      // every wake/online blip — the liveness probe below now decides, closing
-      // only a socket that is provably dead.
-
-      if (!gatewayOpen()) {
-        await attemptReconnect()
-
-        return
-      }
-
-      // The socket reports open, but sleep/wake (or a silent network drop)
-      // can leave a half-open TCP connection: no close event fires, so
-      // connectionState stays 'open' while every RPC hangs until its per-call
-      // timeout — prompt.submit's is 30 minutes, which reads as "enter does
-      // nothing until I restart the app". Probe liveness with a short-bounded
-      // ping; on failure force the socket down so the onState handler above
-      // schedules a reconnect (and resetTileRuntimeBindings re-resumes tiles),
-      // instead of letting the user's next submit hang against a dead socket.
-      //
-      // A TIMEOUT is not always proof of death, though (#95327): a backend
-      // mid-tool-call can starve its loop past this budget while perfectly
-      // alive, and tearing the socket down then feeds the gateway's
-      // ws_orphan_reap interrupt — the turn dies as a bare "Operation
-      // interrupted." placeholder. While any session still reports working,
-      // one inconclusive probe DEFERS the teardown behind a bounded re-probe;
-      // only an exhausted streak (or no in-flight work) closes.
-      try {
-        await probeGatewayLiveness(gateway)
-        livenessProbeFailures = 0
-      } catch (probeErr) {
-        // A version-skewed backend that predates the ping method answers
-        // -32601 (method not found) — a HEALTHY response, not a dead socket.
-        // Force-closing on it would spin the reconnect loop forever. Every
-        // other failure (timeout on a swallowed ping, transport error) means
-        // the socket is not PROVABLY alive and must eventually be rebuilt.
-        if (probeErr instanceof JsonRpcGatewayError && probeErr.code === -32601) {
-          livenessProbeFailures = 0
-
-          return
-        }
-
-        livenessProbeFailures += 1
-
-        const decision = decideLivenessForceClose({
-          workingSessionCount: $workingSessionIds.get().length,
-          consecutiveFailures: livenessProbeFailures
-        })
-
-        if (!decision.close) {
-          scheduleLivenessReprobe()
-
-          return
-        }
-
-        livenessProbeFailures = 0
-        ownCloseReason = 'timeout'
-        gateway.close()
+    // OAuth session expired mid-reconnect: surface the actionable "sign in
+    // again" recovery overlay once instead of silently looping the backoff
+    // against a ticket that can never succeed. Transport failures fall through
+    // to the backoff below — they must NOT take the full-screen "couldn't start"
+    // path (locks reading/drafting).
+    const notePrimaryReauth = (error: unknown) => {
+      if (!cancelled && isGatewayReauthRequired(error) && !reauthNotified) {
+        primaryReauthError = error instanceof Error ? error.message : String(error)
+        syncPrimaryReauthError()
+        reauthNotified = true
+        notifyPrimaryReauth(primaryReauthError, () => primaryReauthError ?? '')
       }
     }
+
+    // ── Wake path (#C2a): see ./use-gateway-boot-wake ─────────────────────
+    const wake = createWakeRecovery({
+      holdoffMs: WAKE_RECONNECT_HOLDOFF_MS,
+      ready: () => !cancelled && bootCompleted && !$gatewaySwitching.get(),
+      primary: () => gateway,
+      // Read at dial time: primaryListeners is declared below, in this effect.
+      attach: client => primaryListeners(client),
+      promote: (successor, detachSuccessor, conn) => {
+        const detachPrevious = offPrimary
+        gateway = successor
+        offPrimary = detachSuccessor
+        // detachPrevious runs at the KEEPING side (#C2a r2): a generation kept
+        // for a running turn stays SERVED until it retires (listener lifetime
+        // = socket lifetime, #95327). Frames both sockets carry are absorbed
+        // by the #120005 gate; stale state edges by the primaryListeners guard.
+        setPrimaryGateway(successor, normalizeProfileKey($activeGatewayProfile.get()))
+        recordPrimaryConnection(conn)
+        callbacksRef.current.onGatewayReady(successor)
+        reportPrimaryGatewayState(successor.connectionState)
+        notePrimaryOpened()
+
+        return detachPrevious
+      },
+      resolveRoute: resolvePrimaryRoute,
+      redial: () => attemptReconnect(),
+      finish: conn => finishPrimaryConnect(conn, undefined, { keepTurnClaims: true }),
+      noteReauth: notePrimaryReauth
+    })
+
+    const wakeNow = (hard: boolean) => {
+      clearReconnectTimer()
+      resetReconnectBackoff()
+      wake.wake(hard)
+    }
+
+    const offWakeSignals = wake.bindSignals(wakeNow)
 
     // Adopt the profile the primary (window) backend booted as, so same-profile
     // resumes are no-op swaps and reconnects target the right backend.
@@ -898,7 +887,7 @@ export function useGatewayBoot({
         const ownsSwitch = () => !cancelled && switchToken !== null && isCurrentGatewaySwitch(switchToken)
         clearReconnectTimer()
         clearBootRetryTimer()
-        clearLivenessReprobeTimer()
+        probe.cancelReprobe()
         livenessProbeFailures = 0
         bootRetryAttempt = 0
         resetReconnectBackoff()
@@ -1106,7 +1095,11 @@ export function useGatewayBoot({
       }
     }
 
-    const gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    // `let`: the wake path REPLACES the primary generation in place (#C2a,
+    // adoptPrimaryGeneration), and every closure below must keep reading the
+    // CURRENT primary — that is what keeps one window owned by exactly one live
+    // socket across a wake.
+    let gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
 
     // Every socket this window owns (the primary below, every registry
     // secondary via onEvent) funnels through this one gate before any store
@@ -1147,6 +1140,9 @@ export function useGatewayBoot({
       foregroundScopes: foregroundSessionScopes,
       // Defined further down the effect body; read at call time, never during boot.
       liveScopes: () => liveWorkScopes(),
+      // The registry's two dial points read this (#C2a): a parked window (hidden,
+      // ladders standing down) opens no pool socket at all.
+      routesParked: secondaryReconnectsParked,
       onLocalProfileRetired: forgetProfileOnlyRuntimeOwners,
       onActiveConnectionChanged: publish,
       // Keep $activeGatewayProfile in lockstep with the registry's OWN record
@@ -1194,141 +1190,158 @@ export function useGatewayBoot({
     const offActiveGatewayReauth = $gateway.listen(syncPrimaryReauthError)
     const offActiveStateReauth = $gatewayState.listen(syncPrimaryReauthError)
 
-    // C1 (t_c1f387b2): the shared client measures dial/ready/replay-barrier/usable per socket
-    // generation; they fill the open reconnect episode, which settles on the usable stamp.
-    const offSocketPhases = gateway.onSocketPhases(phases => noteReconnectSocketPhases(phases))
-
-    const offState = gateway.onState(st => {
-      // Mirror to the composer only while the primary is the active profile —
-      // a background secondary reconnect mustn't flip the foreground state.
-      reportPrimaryGatewayState(st)
-
-      if (st === 'open') {
-        bootSnapshotSuperseded = true
-        openedAt = Date.now()
-        reauthNotified = false
-        primaryReauthError = null
-        livenessProbeFailures = 0
-        clearReconnectTimer()
-        clearLivenessReprobeTimer()
-
-        // A revalidate-driven reconnect can rebuild the backend in place when the
-        // cached remote was found dead, which re-drives the boot-progress overlay.
-        // Unlike the initial boot, nothing calls completeDesktopBoot() afterwards,
-        // so dismiss it here once we're open again — otherwise the overlay sticks
-        // at ~94%. A no-op on a normal (non-rebuild) reconnect.
-        if (bootCompleted) {
-          completeDesktopBoot()
-        }
-      } else if (st === 'closed' || st === 'error') {
-        if (isStableOpen(openedAt)) {
-          resetReconnectBackoff()
-        }
-
-        // The connected→disconnected edge after a healthy boot, not a switch or our own manual close.
-        if (openedAt !== null && bootCompleted && !$gatewaySwitching.get() && ownCloseReason !== 'manual') {
-          noteBackendDrop(ownCloseReason === 'timeout' ? 'timeout' : null)
-          // C1: the close starts the episode clock; detect_ms runs to the redial decision,
-          // so the backoff ladder and wake holdoffs live inside it — the fat the reconnect
-          // brief measured at 7.9–8.9 s in production logs.
-          beginReconnectEpisode({
-            closeReason: ownCloseReason === 'timeout' ? 'timeout' : 'network',
-            visibilityAtClose: windowVisibility()
-          })
-        }
-
-        ownCloseReason = null
-        openedAt = null
-
-        if (bootCompleted && !$gatewaySwitching.get()) {
-          // The socket dropped after a healthy boot (typically sleep/wake). Try
-          // to bring it back instead of leaving the composer stuck disabled.
-          scheduleReconnect()
-        }
-      }
-    })
-
     // Read PER EVENT, never once at boot: under multiplex-only this one socket
     // serves every local profile, and the profile moves under it while the
     // socket stays open. A boot-time capture stamps every later profile's
     // events with whatever was active when the gateway booted.
     const sourceProfileNow = () => normalizeProfileKey($activeGatewayProfile.get())
 
-    const offEvent = gateway.onEvent(event => {
-      // The composer reads the wire per owner connection; the primary's own route names it.
-      if (event.type === 'gateway.ready') {
-        recordConnectionWire(primaryWireSource($primaryGatewayRoute.get(), $connection.get()), gateway.sessionWire)
+    // Bookkeeping a healthy primary owes the window on opening; the wake's
+    // promote() drives it too (that successor opened before becoming primary).
+    const notePrimaryOpened = () => {
+      bootSnapshotSuperseded = true
+      openedAt = Date.now()
+      reauthNotified = false
+      primaryReauthError = null
+      probe.noteHealthy()
+      clearReconnectTimer()
+
+      // A revalidate-driven reconnect can rebuild the backend in place when the
+      // cached remote was found dead, which re-drives the boot-progress overlay.
+      // Unlike the initial boot, nothing calls completeDesktopBoot() afterwards,
+      // so dismiss it here once we're open again — otherwise the overlay sticks
+      // at ~94%. A no-op on a normal (non-rebuild) reconnect.
+      if (bootCompleted) {
+        completeDesktopBoot()
       }
-
-      const connectionId = activeGatewayConnectionId()
-      const sourceProfile = canonicalOwnerProfile(event) ?? sourceProfileNow()
-
-      const scopedEvent = {
-        ...event,
-        profile: sourceProfile,
-        ...(connectionId ? { connectionId } : {})
-      }
-
-      // On a shared host backend the socket no longer PROVES the profile the
-      // way a pooled secondary's closure did, so nothing stamps ownership and
-      // runtimeSessionOwner() stays blank for every non-primary local profile
-      // — the live sessions/cron sync dies and falls back to slow polling.
-      // The shared-primary descriptor is exactly the topology where the active
-      // profile is the authority for this socket's traffic. (The marker is the
-      // LAST rung of knownOwnerForSession, so durable stored identity still
-      // outranks it — #97511.)
-      const ownedEvent =
-        $connection.get()?.sharedPrimary === true ? stampSecondaryProfileOwner(scopedEvent, sourceProfile) : scopedEvent
-
-      deliverGatewayEvent(ownedEvent)
-    })
-
-    // Secondary sockets reach the same handler through the registry's onServerRequest.
-    const offRequest = gateway.onRequest(request => dispatchPrimaryServerRequest(request, sourceProfileNow()))
-
-    // Wake signals: power resume (macOS/Windows), network coming back, and the
-    // window regaining focus/visibility. Each nudges an immediate reconnect.
-    //
-    // Forced reconnects (power resume / 'online') close and redial every open
-    // secondary socket. Windows fires 'online' on any interface change — VPN
-    // connects, Wi-Fi blips, virtual adapter enumeration — so an unthrottled
-    // handler reaped healthy sockets in bursts and the UI remounted on every
-    // redial: the #94769 flicker loop. Coalesce forced wakes like the main
-    // process already does for power-resume revalidation
-    // (POWER_RESUME_REVALIDATION_HOLDOFF_MS): one forced reconnect per
-    // holdoff window; a socket dropped in between is still picked up by the
-    // ordinary close/reconnect backoff and by the non-forced focus/visibility
-    // nudges below.
-    let lastForcedWakeReconnectAt = 0
-
-    const forceReconnectNow = () => {
-      // reconnectNow no-ops while boot is incomplete or a gateway switch is in
-      // flight; stamping the holdoff then would burn the window and drop the
-      // next 'online' (often the one with the network actually back), leaving
-      // recovery to the backoff loops. Stamp only when it will proceed.
-      if (cancelled || !bootCompleted || $gatewaySwitching.get()) {
-        return
-      }
-
-      // Only the destructive half is coalesced: a second wake inside the
-      // holdoff (macOS fires resume then 'online' seconds apart) still runs
-      // the cheap, idempotent nudge — primary ping probe, redial of already
-      // closed secondaries — without touching open sockets.
-      const now = Date.now()
-      const forced = now - lastForcedWakeReconnectAt >= WAKE_RECONNECT_HOLDOFF_MS
-
-      if (forced) {
-        lastForcedWakeReconnectAt = now
-      }
-
-      void reconnectNow({ forceOpenSocket: forced })
     }
 
-    const offPowerResume = desktop.onPowerResume?.(() => void forceReconnectNow())
+    /**
+     * Everything a PRIMARY client is wired to, as one attach/detach pair.
+     *
+     * It has to be a function of the client (not of the module) because the wake
+     * path REPLACES the primary generation (#C2a): the successor gets the same
+     * four subscriptions before it dials; the replaced client keeps its own
+     * until it closes (kept for a turn = kept SERVED, #95327). Handlers split
+     * by kind: events deliver for every attached generation (the #120005 gate
+     * absorbs double frames); state edges speak only while `client` IS primary.
+     */
+    const primaryListeners = (client: HermesGateway): (() => void) => {
+      // C1 (t_c1f387b2): the shared client measures dial/ready/replay-barrier/usable per socket
+      // generation; they fill the open reconnect episode, which settles on the usable stamp.
+      const offSocketPhases = client.onSocketPhases(phases => noteReconnectSocketPhases(phases))
+
+      const offState = client.onState(st => {
+        // Only the CURRENT primary speaks for the window (#C2a r2). A kept
+        // generation stays attached — it must, that is #95327's delivery — but
+        // its socket edges must not flip composer state, open episodes, or
+        // drive the ladder: the successor owns all of that now.
+        if (client !== gateway) {
+          return
+        }
+
+        // Mirror to the composer only while the primary is the active profile —
+        // a background secondary reconnect mustn't flip the foreground state.
+        reportPrimaryGatewayState(st)
+
+        if (st === 'open') {
+          notePrimaryOpened()
+        } else if (st === 'closed' || st === 'error') {
+          if (isStableOpen(openedAt)) {
+            resetReconnectBackoff()
+          }
+
+          // The connected→disconnected edge after a healthy boot, not a switch or our own manual close.
+          if (openedAt !== null && bootCompleted && !$gatewaySwitching.get() && ownCloseReason !== 'manual') {
+            noteBackendDrop(ownCloseReason === 'timeout' ? 'timeout' : null)
+
+            // A PARKED window is not reconnecting: its ladder is disarmed until
+            // the user comes back, so an episode opened here would run from this
+            // close all the way to the return and report the whole park as
+            // detect_ms (#C2a). The return's own wake dial opens the episode
+            // that describes the reconnect the user actually experiences.
+            if (!secondaryReconnectsParked()) {
+              // C1: the close starts the episode clock; detect_ms runs to the redial decision,
+              // so the backoff ladder and wake holdoffs live inside it — the fat the reconnect
+              // brief measured at 7.9–8.9 s in production logs.
+              beginReconnectEpisode({
+                closeReason: ownCloseReason === 'timeout' ? 'timeout' : 'network',
+                visibilityAtClose: windowVisibility()
+              })
+            }
+          }
+
+          ownCloseReason = null
+          openedAt = null
+
+          if (bootCompleted && !$gatewaySwitching.get()) {
+            // The socket dropped after a healthy boot (typically sleep/wake). Try
+            // to bring it back instead of leaving the composer stuck disabled.
+            scheduleReconnect()
+          }
+        }
+      })
+
+      const offEvent = client.onEvent(event => {
+        // The composer reads the wire per owner connection; the primary's own route names it.
+        if (event.type === 'gateway.ready') {
+          recordConnectionWire(primaryWireSource($primaryGatewayRoute.get(), $connection.get()), client.sessionWire)
+        }
+
+        const connectionId = activeGatewayConnectionId()
+        const sourceProfile = canonicalOwnerProfile(event) ?? sourceProfileNow()
+
+        const scopedEvent = {
+          ...event,
+          profile: sourceProfile,
+          ...(connectionId ? { connectionId } : {})
+        }
+
+        // On a shared host backend the socket no longer PROVES the profile the
+        // way a pooled secondary's closure did, so nothing stamps ownership and
+        // runtimeSessionOwner() stays blank for every non-primary local profile
+        // — the live sessions/cron sync dies and falls back to slow polling.
+        // The shared-primary descriptor is exactly the topology where the active
+        // profile is the authority for this socket's traffic. (The marker is the
+        // LAST rung of knownOwnerForSession, so durable stored identity still
+        // outranks it — #97511.)
+        const ownedEvent =
+          $connection.get()?.sharedPrimary === true ? stampSecondaryProfileOwner(scopedEvent, sourceProfile) : scopedEvent
+
+        deliverGatewayEvent(ownedEvent)
+      })
+
+      // Secondary sockets reach the same handler through the registry's onServerRequest.
+      const offRequest = client.onRequest(request => dispatchPrimaryServerRequest(request, sourceProfileNow()))
+
+      return () => {
+        offSocketPhases()
+        offState()
+        offEvent()
+        offRequest()
+      }
+    }
+
+    let offPrimary = primaryListeners(gateway)
+
+    // Power resume (macOS/Windows): a HARD one-dial recovery (the socket after
+    // a sleep is presumptively dead), like the module's own window signals;
+    // its destructive pool sweep is coalesced to one per holdoff window.
+    const offPowerResume = desktop.onPowerResume?.(() => wakeNow(true))
     const offConnectionApplied = desktop.onConnectionApplied?.(() => void softSwitch())
 
     const offGatewayReconnect = registerGatewayReconnect(async (options?: GatewayReconnectOptions) => {
       if (cancelled || !bootCompleted || $gatewaySwitching.get()) {
+        return
+      }
+
+      // A window-lifecycle signal is not a manual recovery: dial a replacement
+      // generation under the old socket instead of tearing anything down, and
+      // retry a credential it never touched. This branch is what makes a wake
+      // single-flight — reconnectGateway coalesces concurrent callers.
+      if (options?.source === 'wake') {
+        await wake.dial()
+
         return
       }
 
@@ -1370,37 +1383,17 @@ export function useGatewayBoot({
       // self-inflict the reconnect the follow-through is meant to perform.
       // Probe first: a provably-alive transport is left alone, and while a
       // turn is in flight an inconclusive probe defers behind the same
-      // bounded re-probe the wake path uses (#95327) instead of
+      // bounded re-probe the wake path used to use (#95327) instead of
       // deterministically killing it. A probe that stays unanswered with no
       // work in flight still closes and re-dials, so a restart that DID take
       // this socket down is recovered here and now.
-      try {
-        await probeGatewayLiveness(gateway)
-        livenessProbeFailures = 0
+      const verdict = await probe.probeOnce()
 
+      // 'alive' — including the version-skewed -32601 answer — leaves the socket
+      // exactly where it is; 'deferred' keeps it and re-probes. Only a socket the
+      // probe proved dead falls through to the redial below.
+      if (verdict !== 'dead') {
         return
-      } catch (probeErr) {
-        // A version-skewed backend that predates the ping method answers
-        // -32601 (method not found) — a HEALTHY response, not a dead socket.
-        if (probeErr instanceof JsonRpcGatewayError && probeErr.code === -32601) {
-          livenessProbeFailures = 0
-
-          return
-        }
-
-        const decision = decideLivenessForceClose({
-          workingSessionCount: $workingSessionIds.get().length,
-          consecutiveFailures: livenessProbeFailures + 1
-        })
-
-        if (!decision.close) {
-          livenessProbeFailures += 1
-          scheduleLivenessReprobe()
-
-          return
-        }
-
-        livenessProbeFailures = 0
       }
 
       ownCloseReason = 'manual'
@@ -1439,78 +1432,10 @@ export function useGatewayBoot({
       }
     })
 
-    const onOnline = () => void forceReconnectNow()
-
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') {
-        void reconnectNow()
-      }
-    }
-
-    const onFocus = () => void reconnectNow()
-
-    window.addEventListener('online', onOnline)
-    document.addEventListener('visibilitychange', onVisible)
-    // Focus nudge: Electron keeps document 'visible' while unfocused, and a
-    // macOS wake often restores focus without a visibilitychange — without
-    // this a socket dropped during sleep sits closed until the user clicks.
-    window.addEventListener('focus', onFocus)
-
     // Bound concurrency cost to consumers: keep a background socket while its
-    // profile has a running (working) or blocked (needs-input) session, OR an
-    // open owner-routed tile (Bot chats stay on a secondary while chrome stays
-    // on the launch profile). Once the last consumer leaves, the socket drops
-    // (the gateway behind it keeps running). The active profile is always spared.
-    // Do not key this off `entry.retained` — that flag only skips dispose-after-
-    // RPC; idle prune is what reclaims hover-warmed sockets after you leave.
-    // Scopes with a running or needs-input session: registry-scoped
-    // (connectionId, profile) keys plus the bare profile of every live local
-    // session. Two sources can expose the same profile name (every source has
-    // a 'default'), so bare profile names can't represent a non-local
-    // source's liveness without keeping the wrong gateway alive. Feeds the
-    // pruner's keep-set and the wake probe's in-flight-work signal.
-    const liveWorkScopes = (): Set<string> => {
-      const live = new Set([...$workingSessionIds.get(), ...$attentionSessionIds.get()])
-      const scopes = liveSessionScopes()
-
-      for (const session of $sessions.get()) {
-        if (live.has(session.id)) {
-          scopes.add(normalizeProfileKey(session.profile))
-        }
-      }
-
-      return scopes
-    }
-
-    const recomputeKeptGateways = () => {
-      const keep = new Set([...liveWorkScopes(), ...foregroundSessionScopes()])
-
-      for (const scope of openTileGatewayScopes()) {
-        keep.add(scope)
-      }
-
-      // A just-created session's owner hold and every open pane's owner ride
-      // in through foregroundSessionScopes above; the registry ALSO reads that
-      // set itself (its `foregroundScopes` hook) so the refcount-0 lease
-      // releases agree with this pruner. This recompute only has to RUN when
-      // they change — see the tile / selected session / hold subscriptions.
-      pruneSecondaryGateways(keep)
-    }
-
-    // The pruner is otherwise event-driven: a socket spared by the
-    // min-lifetime grace with no store change afterwards would stay open
-    // forever. Pool keepalive touches are gone (the canonical gateway outlives
-    // its viewers); only this recompute tick remains.
-    const pruneTimer = setInterval(() => recomputeKeptGateways(), 60_000)
-
-    const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())
-    const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
-    const offActiveSession = $activeSessionId.subscribe(() => recomputeKeptGateways())
-    const offSessionTiles = $sessionTiles.subscribe(() => recomputeKeptGateways())
-    const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
-    const offTiles = $sessionTiles.subscribe(() => recomputeKeptGateways())
-    const offSelectedSession = $selectedStoredSessionId.subscribe(() => recomputeKeptGateways())
-    const offSessionOwnerHolds = $sessionOwnerHoldRevision.subscribe(() => recomputeKeptGateways())
+    // profile has live work or an open owner-routed tile (see gateway-keepset,
+    // moved out of this effect by #C2a).
+    const offKeptGateways = bindKeptGatewayRecompute()
 
     const offWindowState = desktop.onWindowStateChanged?.(payload => {
       const current = $connection.get()
@@ -1814,29 +1739,16 @@ export function useGatewayBoot({
       endGatewaySwitch()
       clearReconnectTimer()
       clearBootRetryTimer()
-      clearLivenessReprobeTimer()
-      clearInterval(pruneTimer)
-      offWorking()
-      offAttention()
-      offActiveSession()
-      offSessionTiles()
-      offActiveProfile()
-      offTiles()
-      offSelectedSession()
-      offSessionOwnerHolds()
-      window.removeEventListener('online', onOnline)
-      document.removeEventListener('visibilitychange', onVisible)
-      window.removeEventListener('focus', onFocus)
+      probe.cancelReprobe()
+      offKeptGateways()
+      offWakeSignals()
       offPowerResume?.()
       offConnectionApplied?.()
       offConnectionsChanged?.()
       offGatewayReconnect()
       offActiveGatewayReauth()
       offActiveStateReauth()
-      offSocketPhases()
-      offState()
-      offEvent()
-      offRequest()
+      offPrimary()
       offExit()
       offWindowState?.()
       offBootProgress()
@@ -1860,6 +1772,9 @@ export function useGatewayBoot({
 
       closeSecondaryGateways()
       gateway.close()
+      // A generation replaced by a wake is this window's socket too (it is only
+      // kept while a turn rides it): a real unmount takes it with the rest.
+      wake.dispose()
       publish(null)
       callbacksRef.current.onGatewayReady(null)
       setPrimaryGateway(null)

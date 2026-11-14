@@ -1,6 +1,6 @@
 import { translateNow } from '@/i18n'
 
-export type GatewayReconnectSource = 'manual' | 'restart-followthrough'
+export type GatewayReconnectSource = 'manual' | 'restart-followthrough' | 'wake'
 
 export interface GatewayReconnectOptions {
   /**
@@ -10,6 +10,10 @@ export interface GatewayReconnectOptions {
    * automatic hand-off after a gateway restart: the socket often SURVIVED
    * (the restart targets the messaging gateway, not this client's backend),
    * so the handler probes first instead of force-closing a healthy socket.
+   * `'wake'` is a window-lifecycle recovery signal (visibility/focus/online/
+   * power-resume): the socket after a sleep is presumptively dead, so the
+   * handler DIALS a replacement immediately — no liveness probe — and retires
+   * the old generation only once the replacement reports ready (#C2a).
    */
   source?: GatewayReconnectSource
 }
