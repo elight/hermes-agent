@@ -327,6 +327,28 @@ def test_a_batch_a_client_cannot_read_is_refused(webapp, body):
     assert response.status_code in (400, 404, 429), (body, response.status_code)
 
 
+def test_an_oversized_count_is_refused_before_a_list_of_that_size_exists(webapp):
+    """The cap is read off the NUMBER in the request, never off a list built from it.
+
+    ``_batch_socket_names`` multiplies ``[socket] * count`` for the ``count`` form, so a bound that
+    reads ``len(names)`` runs only *after* that allocation: a ~50-byte body then buys a count-sized
+    list on the serving process before it is refused.
+
+    * ``2 ** 100`` first: not an index CPython can hold, so an implementation that builds the list
+      before the check answers OverflowError, never 429.
+    * ``10 ** 9``: the row the earlier review measured at ~12 s / ~8 GB on the build-first code (the
+      same path measured 242 ms at 20,000,000). Ordered after the row above so an unfixed run stops
+      on the cheap one instead of spending that memory again.
+    * ``MAX_BATCH_TICKETS + 1``: the boundary, through the ``count`` form this time.
+    """
+    from hermes_cli.web_routers.webapp import MAX_BATCH_TICKETS
+
+    for count in (2 ** 100, 10 ** 9, MAX_BATCH_TICKETS + 1):
+        response = webapp.client.post("/api/webapp/socket-ticket", headers=_SESSION,
+                                      json={"socket": "gateway", "count": count})
+        assert response.status_code == 429, (count, response.status_code, response.text)
+
+
 def test_a_batch_is_still_authenticated_before_anything_is_minted(webapp):
     assert webapp.client.post("/api/webapp/socket-ticket", json={"sockets": ["gateway"]}).status_code == 401
 

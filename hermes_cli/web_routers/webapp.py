@@ -261,12 +261,28 @@ def _socket_profile_home(name: str, profile: str | None) -> str | None:
     return str(home) if name == GATEWAY_SOCKET and profile else None
 
 
+def _refuse_oversized_batch(asked: int) -> None:
+    """429 for a batch the REQUEST asks for, before a list of that size is built for it.
+
+    ``asked`` is a number out of the body, never the length of a list built from the body:
+    ``[socket] * count`` is a count-sized allocation this process pays before any cap could refuse
+    it, for a body of ~50 bytes.
+    """
+    if asked > MAX_BATCH_TICKETS:
+        raise HTTPException(429, f"at most {MAX_BATCH_TICKETS} tickets per request")
+
+
 async def _batch_socket_names(request: Request, socket: str) -> list[str] | None:
     """The sockets one POST asks for, in order — None for the body-less single-ticket query form.
 
     Body: ``{"sockets": [name, ...]}`` (one ticket per entry) or ``{"socket": name, "count": n}``
     (n dials of that socket). Nothing else is accepted: a batch names sockets explicitly, so a typo
     is a 400 rather than a silence.
+
+    ``count`` is bounded from the number itself, **before** it is materialised: any caller holding
+    the dashboard session token (every signed-in tab) reaches this route, and the body has no size
+    limit, so a list built first would let ``{"socket": "gateway", "count": 1000000000}`` ask the
+    serving process for ~8 GB before the 429.
     """
     raw = await request.body()
     if not raw:
@@ -282,11 +298,11 @@ async def _batch_socket_names(request: Request, socket: str) -> list[str] | None
     if count is not None:
         if type(count) is not int or count < 1:
             raise HTTPException(400, "count must be a positive integer")
+        _refuse_oversized_batch(count)
         names = [body.get("socket") or socket] * count
     if not isinstance(names, list) or not names:
         raise HTTPException(400, "Batch ticket needs {sockets: [...]} or {socket, count}")
-    if len(names) > MAX_BATCH_TICKETS:
-        raise HTTPException(429, f"at most {MAX_BATCH_TICKETS} tickets per request")
+    _refuse_oversized_batch(len(names))
     return [name if isinstance(name, str) and name else socket for name in names]
 
 
