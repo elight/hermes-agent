@@ -226,6 +226,12 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
       const route = await host.resolveRoute()
 
       if (!route) {
+        // No route this dial may touch (its contract: null when a newer
+        // boot/apply owns the socket, or the window is going away). The episode
+        // above is THIS dial's — end it on its own clock like every other exit
+        // here; left open, the next unrelated usable/begin would settle it.
+        abandonEpisode()
+
         return
       }
 
