@@ -12,8 +12,13 @@ stamped it and the next run handed off for review (hermes-agent board,
 The write (:func:`retire_superseded_failure`, called from
 :func:`kanban_db._end_run`), the read (:func:`blocks_respawn`), and the set both
 share (:data:`SUPERSEDING_RUN_OUTCOMES`) live here so they cannot drift apart.
-Every other outcome keeps the text live, so a real quota / auth wall still parks
-the card. Neither caller loses the failure: the run row and the event log keep it.
+Reclaim closes (``stale``/``reclaimed``) are the other non-owner: the close
+never worked the card, so it neither produced the text nor owns a stamp an
+earlier run left behind — the automatic non-booking closes clear the column
+on the close itself, and :data:`RECLAIM_RUN_OUTCOMES` keeps the read side
+honest on rows an older install never cleared. Every other outcome keeps the
+text live, so a real quota / auth wall still parks the card. Neither caller
+loses the failure: the run row and the event log keep it.
 """
 
 from __future__ import annotations
@@ -25,6 +30,15 @@ import sqlite3
 # stands in ``review``/``ready`` for the next profile, so a failure text older
 # than this run is history rather than the card's condition.
 SUPERSEDING_RUN_OUTCOMES = frozenset({"completed", "review_requested", "changes_requested"})
+
+# Outcomes of reclaim closes (TTL-expired claim, orphan reconcile,
+# heartbeat-stale, operator reclaim): the close never worked the card, so it
+# produced no failure text of its own and does not OWN a stamp an earlier run
+# left behind. The automatic non-booking closes (reconcile, heartbeat-stale)
+# also clear the column on the close itself; this set is the read-side half,
+# so a card already parked on such a row by an older install unsticks on the
+# next tick (t_f7f7eef4).
+RECLAIM_RUN_OUTCOMES = frozenset({"stale", "reclaimed"})
 
 # Patterns in last_failure_error that indicate a quota / auth blocker.
 # These errors won't resolve by retrying immediately — auto-block instead.
@@ -46,15 +60,21 @@ _RESPAWN_BLOCKER_RE = re.compile(
 def blocks_respawn(error_text: str, latest_outcome: str | None) -> bool:
     """True when the persisted failure text must park the card ``blocker_auth``.
 
-    The text is blocker evidence only while the LATEST ended run still owns it: a
-    successful handoff superseded it, and a plain crash's persisted error folds in
-    the worker's own last output — context rather than a diagnosis, which may
-    quote benign commands such as ``claude auth status`` (#117097).
+    The text is blocker evidence only while the LATEST ended run still owns it:
+    a successful handoff superseded it, a reclaim close (``stale``/``reclaimed``)
+    never worked the card and so owns no earlier stamp, and a plain crash's
+    persisted error folds in the worker's own last output — context rather than
+    a diagnosis, which may quote benign commands such as ``claude auth status``
+    (#117097).
 
     ``error_text`` must already be connection-decoded (``_lossy_text``); a legacy
     BLOB row reaches here as bytes and the pattern cannot scan it.
     """
-    if not error_text or latest_outcome in SUPERSEDING_RUN_OUTCOMES:
+    if (
+        not error_text
+        or latest_outcome in SUPERSEDING_RUN_OUTCOMES
+        or latest_outcome in RECLAIM_RUN_OUTCOMES
+    ):
         return False
     if latest_outcome == "crashed":
         return False
