@@ -151,6 +151,13 @@ class WSTransport:
         #: and for the ``user_id`` the agent is built with (``server._session_auth_user_id``).
         self.auth_identity = auth_identity
         self.desktop_local = False
+        #: This socket is bound to a session authority (``ws.handle_ws``): its session verbs speak the
+        #: canonical wire, ``client.hello`` is answered by the authority, and ``gateway.capabilities``
+        #: says so (``resumed_handshake``) instead of advertising a fold that would answer -32601.
+        self.has_session_authority = False
+        #: Etag of the skin this socket's ``gateway.ready`` frame carried, so the folded handshake
+        #: answers the SAME identity the client compared against (``gateway/session_hello.py``).
+        self.skin_etag = ""
         #: The served profile home whose skin this peer follows (None = the launch home); see change_watcher.
         self.skin_home: str | None = None
         self._closed = False
@@ -462,17 +469,23 @@ def _ws_attach_ready_watchers(transport: WSTransport, authority_connection: Any)
     server.register_live_transport(transport)
 
 
-def _ws_ready_frame(skin_payload: Any, *, has_session_authority: bool) -> dict:
+def _ws_ready_frame(skin_payload: Any, *, has_session_authority: bool, skin_etag: str = "") -> dict:
     """The first frame after accept: the skin plus the flags the reconnect contract gates on.
 
     change_events: this backend broadcasts pet/cron/sessions.changed, so clients can demote
     legacy polls to backstops. replay_epoch lets reconnecting clients detect a backend restart
-    and reset their per-session seq watermarks (event_replay).
+    and reset their per-session seq watermarks (event_replay). skin_etag is the content identity of
+    ``skin``, so a reconnect holding this palette already knows whether it must fetch a body at all.
+    resumed_handshake is TRUE only when this socket has a session authority to answer
+    ``client.hello``: the client then folds its first frame (capabilities + every session's replay +
+    the open requests) into ONE application round trip instead of a capabilities call plus one
+    ``session.events.since`` per session.
     """
     return {
         "jsonrpc": "2.0", "method": "event",
         "params": {"type": "gateway.ready", "payload": {
-            "skin": skin_payload, "change_events": True, "heartbeat": True, "replay_epoch": replay_epoch(),
+            "skin": skin_payload, "skin_etag": skin_etag, "change_events": True, "heartbeat": True,
+            "replay_epoch": replay_epoch(), "resumed_handshake": has_session_authority,
             **({"session_authority": True} if has_session_authority else {}),
         }},
     }
@@ -762,10 +775,13 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
         _log.info("ws accepted peer=%s", peer)
         transport = WSTransport(ws, asyncio.get_running_loop(), peer=peer, auth_identity=auth_identity)
         authority_connection = _authority_connection(ws, transport, auth_identity, operator)
+        transport.has_session_authority = authority_connection is not None
         # resolve_skin() is sync I/O + CPU; pooled so the read loop can drain the frontend's initial RPC burst.
-        skin_payload = await asyncio.to_thread(server.resolve_skin)
+        skin_payload, skin_etag = await asyncio.to_thread(server.resolve_skin_with_etag)
+        # Stamped before the write so the folded handshake answers the etag THIS ready frame carried.
+        transport.skin_etag = skin_etag
         ready_ok = await transport.write_async(_ws_ready_frame(
-            skin_payload, has_session_authority=authority_connection is not None))
+            skin_payload, skin_etag=skin_etag, has_session_authority=authority_connection is not None))
         if ready_ok:
             _ws_attach_ready_watchers(transport, authority_connection)
         # Cross-backend liveness: a heartbeat row lets the startup orphan sweep tell "live but idle
