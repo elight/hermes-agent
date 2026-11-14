@@ -26,11 +26,21 @@ Commands
            are filled in by C1's client-side instrumentation; the measurable
            ones are real measurements of the test instance.
            With --pre-probe PATH, pre_ipc_ms additionally models the Desktop
-           revalidation leg the reconnect path pays before the mint (#C3):
-           one GET of PATH folded in front of the ticket round trip. Same
+           revalidation leg the reconnect path pays before the mint (#C3): one
+           GET of PATH folded in front of the ticket round trip. Same
            instance, same driver, two paths = an honest before/after of which
            endpoint the client probes (/api/status 0.18-1.9 s vs /api/health
            single-digit ms).
+  handshake
+           Count the post-upgrade handshake's APPLICATION ROUND TRIPS per
+           upgrade (--cycles, --watermarks): a backend advertising
+           `resumed_handshake` spends ONE `client.hello` (answered with
+           capabilities + skin etag + every session's replay + the open
+           requests), anything else spends the legacy sequence — one
+           `client.capabilities` plus one `session.events.since` per held
+           cursor. Same driver, same instance, before/after a deploy = the wire
+           cost a reconnect actually charges, which is what the program states
+           ("1 ticket POST + 1 upgrade + 1 hello/resumed exchange").
 
 Credentials
 -----------
@@ -361,6 +371,127 @@ def cmd_phases(http: Http, args) -> int:
     return 0
 
 
+async def _await_response(ws, request_id: int, budget: float) -> dict | None:
+    """The response frame for *request_id* within *budget* seconds, or None (events interleave)."""
+    deadline = time.perf_counter() + budget
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return None
+        try:
+            raw = await asyncio.wait_for(ws.recv(), remaining)
+        except TimeoutError:
+            return None
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(message, dict) and message.get("id") == request_id:
+            return message
+
+
+async def _handshake_cycle(http: Http, args, ticket: str, source: str) -> dict:
+    """One upgrade's post-upgrade handshake, counted: what the backend asks the client to spend.
+
+    ``--watermarks`` stands in for the sessions a reconnecting client holds: the fold carries every
+    one of them in its single request, while the legacy sequence needs one ``session.events.since``
+    per session — so the column that matters is ``round_trips``, not the milliseconds alone.
+    """
+    websockets = _load_websockets()
+    url = http.ws_url(ticket)
+    watermarks = {f"w{i}": 1 for i in range(args.watermarks)}
+    row: dict = {"source": source, "fold": False, "round_trips": None, "handshake_ms": None,
+                 "ready_ms": None, "sessions_replayed": None, "skin_etag": None, "error": None}
+    async with websockets.connect(url, open_timeout=args.timeout, close_timeout=2,
+                                  ping_interval=None) as ws:
+        t0 = time.perf_counter()
+        try:
+            ready = json.loads(await asyncio.wait_for(ws.recv(), READY_BUDGET_S))
+        except TimeoutError:
+            row["error"] = "no gateway.ready frame"
+            return row
+        payload = (ready.get("params") or {}).get("payload") or {}
+        row["ready_ms"] = (time.perf_counter() - t0) * 1000.0
+        row["fold"] = payload.get("resumed_handshake") is True
+        t_rpc = time.perf_counter()
+        if row["fold"]:
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "client.hello",
+                                      "params": {"capabilities": {"server_requests": True},
+                                                 "watermarks": watermarks}}))
+            answer = await _await_response(ws, 1, RPC_BUDGET_S)
+            row["handshake_ms"] = (time.perf_counter() - t_rpc) * 1000.0
+            row["round_trips"] = 1
+            row["error"] = ((answer or {}).get("error") or {}).get("message")
+            result = (answer or {}).get("result") or {}
+            row["sessions_replayed"] = len(result.get("per_session_replay") or [])
+            row["skin_etag"] = bool(result.get("skin_etag"))
+        else:
+            # No advertisement: the sequence the fold replaces — the capabilities probe, then one
+            # replay request per watermarked session (a real client sends both, from its cursors).
+            await ws.send(json.dumps({"jsonrpc": "2.0", "id": 2, "method": "client.capabilities",
+                                      "params": {"server_requests": True}}))
+            answer = await _await_response(ws, 2, RPC_BUDGET_S)
+            row["handshake_ms"] = (time.perf_counter() - t_rpc) * 1000.0
+            row["round_trips"] = 1 + len(watermarks)
+            row["error"] = ((answer or {}).get("error") or {}).get("message")
+    return row
+
+
+def cmd_handshake(http: Http, args) -> int:
+    """The wire cost of a reconnect's post-upgrade handshake, per cycle, with the round-trip count.
+
+    The program target is that after the fold a reconnect costs ONE ticket batch POST + one upgrade +
+    one hello/resumed exchange. This command measures what the deployed build actually charges: a
+    backend advertising ``resumed_handshake`` spends ONE round trip (``client.hello``, answered with
+    capabilities + skin etag + every session's replay + the open requests); anything else spends the
+    legacy sequence — ``client.capabilities`` then one ``session.events.since`` per watermark.
+    """
+    _load_websockets()
+    rows = []
+    for _ in range(args.cycles):
+        ticket, _mint_ms, source = http.mint_ticket()
+        if not ticket:
+            raise SystemExit("qa_gateway: the server returned no ticket")
+        rows.append(asyncio.run(_handshake_cycle(http, args, ticket, source)))
+    folds = [row for row in rows if row["fold"]]
+    round_trips = [float(row["round_trips"]) for row in rows if row["round_trips"] is not None]
+    handshake_ms = [row["handshake_ms"] for row in rows if row["handshake_ms"] is not None]
+    if args.json:
+        print(json.dumps({"cycles": args.cycles, "watermarks": args.watermarks, "rows": rows,
+                          "fold": len(folds) == len(rows) and bool(rows),
+                          "round_trips_p50": percentile(round_trips, 0.50) if round_trips else None,
+                          "handshake_ms_p50": percentile(handshake_ms, 0.50) if handshake_ms else None,
+                          "handshake_ms_p95": percentile(handshake_ms, 0.95) if handshake_ms else None},
+                         indent=2))
+        return 0
+    header = "cycle".ljust(6) + "fold".rjust(7) + "round_trips".rjust(13) + "ready_ms".rjust(11) \
+        + "handshake_ms".rjust(15) + "replayed".rjust(10) + "skin_etag".rjust(11)
+    print(header)
+    print("-" * len(header))
+    for index, row in enumerate(rows, start=1):
+        print(str(index).ljust(6) + ("yes" if row["fold"] else "no").rjust(7)
+              + fmt(row["round_trips"]).rjust(13) + fmt(row["ready_ms"]).rjust(11)
+              + fmt(row["handshake_ms"]).rjust(15) + fmt(row["sessions_replayed"]).rjust(10)
+              + ("yes" if row["skin_etag"] else "no").rjust(11))
+    print("-" * len(header))
+    if handshake_ms:
+        print(f"{'p50'.ljust(6)}{'':7}{'':13}{'':11}{percentile(handshake_ms, 0.50):.1f}".ljust(len(header)))
+        print(f"{'p95'.ljust(6)}{'':7}{'':13}{'':11}{percentile(handshake_ms, 0.95):.1f}".ljust(len(header)))
+    named = {row["error"] for row in rows if row["error"]}
+    for error in sorted(named):
+        print(f"answer error: {error}")
+    print(f"\nn={len(rows)} cycles on {args.cycles} requested; --watermarks models {args.watermarks} "
+          f"held session cursor(s); all values are milliseconds.")
+    if folds and len(folds) == len(rows):
+        print("wire cost per reconnect: 1 ticket POST + 1 upgrade + 1 hello/resumed round trip.")
+    elif rows and not folds:
+        print("wire cost per reconnect: 1 ticket POST + 1 upgrade + 1 client.capabilities round trip "
+              f"+ 1 session.events.since per held cursor ({args.watermarks} here).")
+    else:
+        print("mixed advertisement: some sockets advertise the fold, some do not — read the table.")
+    return 0
+
+
 class ProbeSocket:
     """One reconnect cycle, holding the live socket so the next cycle closes a real one."""
 
@@ -470,6 +601,14 @@ def build_parser() -> argparse.ArgumentParser:
                         help="GET PATH before each mint and fold it into pre_ipc_ms "
                              "(models the Desktop revalidation leg, #C3)")
     sub_json(phases)
+    handshake = sub.add_parser(
+        "handshake",
+        help="count the post-upgrade handshake's application round trips (the fold's wire cost)")
+    handshake.add_argument("--cycles", type=int, default=20, help="upgrades to count (default 20)")
+    handshake.add_argument("--watermarks", type=int, default=4,
+                           help="session cursors the client holds (the legacy sequence spends one "
+                                "replay round trip each; the fold carries them all in one)")
+    sub_json(handshake)
     return parser
 
 
@@ -484,6 +623,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_open(http, args)
     if args.command == "phases":
         return cmd_phases(http, args)
+    if args.command == "handshake":
+        return cmd_handshake(http, args)
     raise SystemExit(f"qa_gateway: unknown command {args.command}")
 
 
