@@ -39,6 +39,7 @@ import {
   ensureReconnectEpisode,
   noteBackendDrop,
   noteBackendExited,
+  noteParkedClose,
   noteReconnectDetection,
   noteReconnectPreIpc,
   noteReconnectSocketPhases,
@@ -1207,7 +1208,16 @@ export function useGatewayBoot({
     const primaryListeners = (client: HermesGateway): (() => void) => {
       // C1 (t_c1f387b2): the shared client measures dial/ready/replay-barrier/usable per socket
       // generation; they fill the open reconnect episode, which settles on the usable stamp.
-      const offSocketPhases = client.onSocketPhases(phases => noteReconnectSocketPhases(phases))
+      // Only the generation that IS the window's primary reports: a kept predecessor still
+      // emits on the way out (a partial, if it never finished its handshake), and filing THAT
+      // in the live episode would overwrite — or settle — the successor's numbers.
+      const offSocketPhases = client.onSocketPhases(phases => {
+        if (client !== gateway) {
+          return
+        }
+
+        noteReconnectSocketPhases(phases)
+      })
 
       const offState = client.onState(st => {
         // Only the CURRENT primary speaks for the window (#C2a r2). A kept
@@ -1246,6 +1256,12 @@ export function useGatewayBoot({
                 closeReason: ownCloseReason === 'timeout' ? 'timeout' : 'network',
                 visibilityAtClose: windowVisibility()
               })
+            } else {
+              // The other half of the guard above: a drop nobody watched still
+              // left a dead primary behind, so the return's dial is a cold
+              // redial of it and says so (`parked_close`). No episode here —
+              // parked time is never inside one.
+              noteParkedClose()
             }
           }
 
