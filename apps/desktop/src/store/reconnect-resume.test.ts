@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionResumeResult } from '@/types/hermes'
 
-import { $sessionStates } from './session-states'
 import {
   beginReconnectResumeEpoch,
   ensureLiveSessionsResumed,
@@ -12,6 +11,7 @@ import {
   type ReconnectResumePorts,
   resetReconnectResumeForTests
 } from './reconnect-resume'
+import { $sessionStates } from './session-states'
 
 const gatewayError = (code: number, reason?: string) =>
   Object.assign(new Error(`gateway refused ${code}`), reason ? { code, data: { reason } } : { code })
