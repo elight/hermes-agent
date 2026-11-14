@@ -113,6 +113,7 @@ import { createPrimaryLivenessProbe } from './primary-liveness-probe'
 import { notifyPrimaryReauth } from './primary-reauth-notice'
 import { useConnectionsRegistry } from './use-connections-registry'
 import { useDefaultProfilePreference } from './use-default-profile-preference'
+import { createBootPostConnectRefreshes } from './use-gateway-boot-post-connect'
 import { createWakeRecovery } from './use-gateway-boot-wake'
 
 // After the reconnect loop has been failing for this long, raise a NON-blocking
@@ -565,11 +566,11 @@ export function useGatewayBoot({
       return { conn, wsUrl }
     }
 
-    // Everything every dial shape owes once its socket is open (#C3 owns
-    // unhanding the two list refreshes). `keepTurnClaims`: a drop may have taken
-    // the backend's runtimes with it so its stale busy claims are retired
-    // (#53902/#73082); the wake path's REPLACEMENT leaves a live turn where it
-    // is, so its claims must survive the socket swap (#C2a).
+    const postConnectRefreshes = createBootPostConnectRefreshes(callbacksRef, () => gateway)
+
+    // Everything every dial shape owes once its socket is open. `keepTurnClaims`: a drop may have
+    // taken the backend's runtimes with it, so its stale busy claims are retired (#53902/#73082);
+    // the wake path's REPLACEMENT keeps a live turn's claims where they are (#C2a).
     const finishPrimaryConnect = async (
       conn: HermesConnection,
       manual?: { profile: string; activationEpoch: number },
@@ -603,8 +604,7 @@ export function useGatewayBoot({
           reconcileBusyStatesOnReconnect()
         }
 
-        await callbacksRef.current.refreshHermesConfig().catch(() => undefined)
-        await callbacksRef.current.refreshSessions().catch(() => undefined)
+        postConnectRefreshes.schedule()
       }
     }
 
@@ -1735,6 +1735,7 @@ export function useGatewayBoot({
       cancelled = true
       // C1: a window torn down mid-reconnect still gets its episode record.
       settleReconnectEpisode('abandoned')
+      postConnectRefreshes.dispose()
       offSwitchLifecycle()
       endGatewaySwitch()
       clearReconnectTimer()

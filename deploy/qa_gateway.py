@@ -25,6 +25,12 @@ Commands
            it has no client replay to wait behind. Those columns print n/a and
            are filled in by C1's client-side instrumentation; the measurable
            ones are real measurements of the test instance.
+           With --pre-probe PATH, pre_ipc_ms additionally models the Desktop
+           revalidation leg the reconnect path pays before the mint (#C3):
+           one GET of PATH folded in front of the ticket round trip. Same
+           instance, same driver, two paths = an honest before/after of which
+           endpoint the client probes (/api/status 0.18-1.9 s vs /api/health
+           single-digit ms).
 
 Credentials
 -----------
@@ -196,6 +202,15 @@ class Http:
             "qa_gateway: neither ticket endpoint minted a ticket. Is the login cookie valid "
             "(credentials) and the listener up?")
 
+    def probe_ms(self, path: str) -> float:
+        """One reachability probe: elapsed ms of GET <path>. Any HTTP answer
+        counts (a 404 still proves the listener is up); a transport failure is
+        the outage the caller's reconnect exists to survive, so send() surfaces
+        it as its own fatal."""
+        t0 = time.perf_counter()
+        self.send("GET", path)
+        return (time.perf_counter() - t0) * 1000.0
+
     def ws_url(self, ticket: str) -> str:
         parsed = urllib.parse.urlparse(self.base_url)
         scheme = "wss" if parsed.scheme == "https" else "ws"
@@ -208,7 +223,7 @@ class Http:
 # --------------------------------------------------------------------------
 def _load_websockets():
     try:
-        import websockets  # noqa: F401  (import here so --help works without it)
+        import websockets  # import here so --help works without it
     except ImportError as exc:  # pragma: no cover - environment guard
         raise SystemExit(
             "qa_gateway: the 'websockets' package is required (run inside the checkout's "
@@ -243,7 +258,8 @@ def fmt(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.1f}"
 
 
-def print_table(rows: list[dict[str, float | None]], cycles: int, sources: set[str]) -> None:
+def print_table(rows: list[dict[str, float | None]], cycles: int, sources: set[str],
+                pre_probe: str | None = None) -> None:
     header = "cycle".ljust(6) + "".join(name.rjust(19) for name in PHASES)
     print(header)
     print("-" * len(header))
@@ -258,6 +274,8 @@ def print_table(rows: list[dict[str, float | None]], cycles: int, sources: set[s
         print(label.ljust(6) + "".join(cells))
     print(f"\nn={len(rows)} cycles on {cycles} requested; all values are milliseconds.")
     print(f"ticket source: {', '.join(sorted(sources)) or 'n/a'}")
+    if pre_probe:
+        print(f"pre_ipc_ms here = GET {pre_probe} + ticket mint (the Desktop revalidation leg, #C3).")
     print("detect_ms is 0.0 by construction here (this driver closes the socket itself);")
     print("replay_barrier_ms is n/a because a gateway-side driver has no replay to wait behind.")
     print("Both are filled by the client-side instrumentation in C1.")
@@ -321,7 +339,7 @@ def cmd_phases(http: Http, args) -> int:
     for _ in range(args.cycles):
         # Each cycle reuses the same view of the server; the close that starts
         # the next cycle is the previous socket's, exactly as a browser's would be.
-        current = ProbeSocket(http, args.timeout)
+        current = ProbeSocket(http, args.timeout, args.pre_probe)
         asyncio.run(current.round(previous))
         rows.append(current.phase)
         sources.add(current.source)
@@ -336,18 +354,20 @@ def cmd_phases(http: Http, args) -> int:
                 "n": len(values),
             }
         print(json.dumps({"cycles": args.cycles, "rows": rows, "summary": summary,
-                          "ticket_sources": sorted(sources)}, indent=2))
+                          "ticket_sources": sorted(sources),
+                          "pre_probe": args.pre_probe or None}, indent=2))
     else:
-        print_table(rows, args.cycles, sources)
+        print_table(rows, args.cycles, sources, args.pre_probe)
     return 0
 
 
 class ProbeSocket:
     """One reconnect cycle, holding the live socket so the next cycle closes a real one."""
 
-    def __init__(self, http: Http, timeout: float):
+    def __init__(self, http: Http, timeout: float, pre_probe_path: str | None = None):
         self._http = http
         self._timeout = timeout
+        self._pre_probe_path = pre_probe_path
         self.phase: dict[str, float | None] = {name: None for name in PHASES}
         self.source = ""
         self._ws = None
@@ -360,8 +380,14 @@ class ProbeSocket:
         self.phase["detect_ms"] = 0.0
         if previous is not None:
             await previous.close()
+        # --pre-probe models the Desktop revalidation leg (#C3): the client's
+        # reconnect GETs a reachability endpoint BEFORE minting, and pre_ipc_ms
+        # is that whole chain. Without the flag the column stays what it was:
+        # the mint round trip alone (the spine's gateway-side contract).
+        pre_probe_ms = (self._http.probe_ms(self._pre_probe_path)
+                        if self._pre_probe_path else 0.0)
         ticket, pre_ipc_ms, self.source = self._http.mint_ticket()
-        self.phase["pre_ipc_ms"] = pre_ipc_ms
+        self.phase["pre_ipc_ms"] = pre_ipc_ms + pre_probe_ms
         if not ticket:
             raise SystemExit("qa_gateway: the server returned no ticket")
         url = self._http.ws_url(ticket)
@@ -375,7 +401,7 @@ class ProbeSocket:
         try:
             await asyncio.wait_for(ws.recv(), READY_BUDGET_S)
             self.phase["ready_ms"] = (time.perf_counter() - t0) * 1000.0
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self.phase["ready_ms"] = None  # nothing unsolicited; the RPC below still measures
         # usable_ms: one real application round trip on the open socket.
         request_id = int(time.time() * 1000) % 1_000_000
@@ -390,7 +416,7 @@ class ProbeSocket:
                 break
             try:
                 raw = await asyncio.wait_for(ws.recv(), remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 break
             try:
                 message = json.loads(raw)
@@ -440,6 +466,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub_json(open_)
     phases = sub.add_parser("phases", help="run the reconnect sequence and print the phase table")
     phases.add_argument("--cycles", type=int, default=20, help="reconnect cycles (default 20)")
+    phases.add_argument("--pre-probe", dest="pre_probe", metavar="PATH", default=None,
+                        help="GET PATH before each mint and fold it into pre_ipc_ms "
+                             "(models the Desktop revalidation leg, #C3)")
     sub_json(phases)
     return parser
 

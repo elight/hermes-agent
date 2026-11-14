@@ -700,6 +700,16 @@ export function ensureReconnectEpisode(
   }
 }
 
+/**
+ * The open reconnect episode's identity, or null when none is open. The object
+ * is stable for the life of one episode and unique per episode — the dedup
+ * token for once-per-episode work (#C3: the deferred post-usable list
+ * refreshes). Opaque here on purpose: the record's fields stay private.
+ */
+export function currentReconnectEpisodeToken(): object | null {
+  return reconnectEpisode
+}
+
 /** Detection ended: the redial decision was made (detect_ms = close/signal → here). */
 export function noteReconnectDetection(now = Date.now()): void {
   if (reconnectEpisode && reconnectEpisode.detectDoneAt === null) {
