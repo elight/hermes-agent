@@ -55,7 +55,7 @@ import {
   secondaryReconnectsParked,
   unparkSecondaryReconnects
 } from '@/store/gateway-park'
-import { reconnectGateway } from '@/store/gateway-reconnect'
+import { registerGatewayPoolRoute, superviseWake } from '@/store/gateway-supervisor'
 import { $workingSessionIds } from '@/store/session-states'
 
 export interface WakeRoute {
@@ -64,8 +64,6 @@ export interface WakeRoute {
 }
 
 export interface WakeHost {
-  /** Holdoff that coalesces the DESTRUCTIVE secondary sweep (never the dial). */
-  holdoffMs: number
   /** True while a recovery step may proceed: booted, not switching, not torn down. */
   ready: () => boolean
   /** The window's CURRENT primary client. */
@@ -110,6 +108,11 @@ export interface WakeRecovery {
    * once (single-flighted). A SOFT signal (plain focus) leaves a primary that
    * reports open alone — alt-tab must not churn a healthy socket; a HARD
    * signal (return-from-park / online / power-resume) replaces one.
+   *
+   * The action itself lives in the window's connection supervisor
+   * (store/gateway-supervisor.superviseWake): a signal that arrives while one is
+   * running joins it, so a burst of wake signals is one ticket batch and one
+   * dial rather than one per signal per family.
    */
   wake: (hard: boolean) => void
   /** The `'wake'` reconnect handler: dial a replacement generation. */
@@ -117,7 +120,6 @@ export interface WakeRecovery {
 }
 
 export function createWakeRecovery(host: WakeHost): WakeRecovery {
-  let lastForcedSweepAt = 0
   /**
    * Sockets a wake replaced but kept, because a turn was riding them (#95327).
    * Each entry carries the generation's app-listener detach: a kept socket is
@@ -126,6 +128,12 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
    * breath as the close, never before.
    */
   const replacedGenerations: Array<{ client: HermesGateway; detach: () => void }> = []
+
+  // The pool's half of a wake, handed to the window's supervisor: a signal
+  // nudges the pooled routes from inside the supervisor's ONE coalesced action
+  // (and only from there), so a burst of signals cannot start one redial family
+  // per signal. The destructive half is the supervisor's holdoff to gate.
+  const offPoolRoute = registerGatewayPoolRoute({ nudge: reconnectSecondaryGateways })
 
   const closeReplaced = () => {
     for (const previous of replacedGenerations.splice(0)) {
@@ -167,17 +175,6 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
 
     detachPrevious()
     previous.close()
-  }
-
-  const sweep = (): { forceOpenSockets: boolean } => {
-    const now = Date.now()
-    const forced = now - lastForcedSweepAt >= host.holdoffMs
-
-    if (forced) {
-      lastForcedSweepAt = now
-    }
-
-    return { forceOpenSockets: forced }
   }
 
   const dial = async (): Promise<void> => {
@@ -287,6 +284,7 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
     drain,
     dispose: () => {
       offWorkDrained()
+      offPoolRoute()
       closeReplaced()
     },
     park: parkSecondaryReconnects,
@@ -296,19 +294,12 @@ export function createWakeRecovery(host: WakeHost): WakeRecovery {
         return
       }
 
-      reconnectSecondaryGateways(sweep())
-
-      if (!hard && host.primary().connectionState === 'open') {
-        // Focus on a socket that reports open: nothing this signal knows says
-        // the transport moved. A genuinely half-open one dies on its own when
-        // the heartbeat deadline runs — the ladder, not the alt-tab, rebuilds it.
-        return
-      }
-
-      // Single-flight: a burst of wake signals (macOS resume + unlock + a
-      // network change, seconds apart) joins ONE dial instead of stacking
-      // replacement sockets.
-      void reconnectGateway({ source: 'wake' }).catch(() => undefined)
+      // ONE action per signal, in the window's supervisor: it nudges the pool,
+      // dials the primary once (single-flight — a burst of wake signals joins
+      // the dial already in flight) and gates the destructive sweep behind its
+      // own holdoff. A focus on a socket that reports open dials nothing; the
+      // supervisor reads that from the primary's own report.
+      superviseWake(hard)
     }
   }
 }
