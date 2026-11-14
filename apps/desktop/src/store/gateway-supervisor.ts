@@ -244,10 +244,10 @@ function ladderFor(routeId: string): RouteLadder {
  * The armed run is skipped when the window is parked (#C2a): a hidden window
  * dials nothing, whatever was armed before the park went up.
  */
-export function armRouteRetry(routeId: string, run: () => void, options: { blocked?: () => boolean } = {}): void {
+export function armRouteRetry(routeId: string, run: () => void): void {
   const ladder = ladderFor(routeId)
 
-  if (ladder.timer !== null || (options.blocked?.() ?? false)) {
+  if (ladder.timer !== null) {
     return
   }
 

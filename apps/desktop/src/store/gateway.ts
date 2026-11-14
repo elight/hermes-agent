@@ -15,12 +15,6 @@ import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { UnservedProfileError } from '@/lib/browser-served-profiles'
-import {
-  decideLivenessForceClose,
-  LIVENESS_REPROBE_DELAY_MS,
-  probeGatewayLiveness
-} from '@/lib/gateway-liveness-policy'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { traceIdentityChange } from '@/lib/identity-trace'
 import { isPermanentLocalGatewayEnsureError } from '@/lib/local-gateway-ensure-failure'
 import { initialGatewayProfile } from '@/lib/platform'
@@ -32,6 +26,11 @@ import { isKeptRoute, keptRouteOpened } from '@/store/gateway-kept-routes'
 import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
 import type { RegistryConfig } from '@/store/gateway-registry-config'
 import { publishRequestConnection } from '@/store/gateway-request-scope'
+import {
+  clearSecondaryLivenessReprobe,
+  probeSecondaryLiveness,
+  type SecondaryLivenessHost
+} from '@/store/gateway-secondary-liveness'
 import {
   isPrimaryRider,
   notePrimaryRider,
@@ -615,6 +614,14 @@ function publishActiveConnection(connection: HermesConnection): void {
  *  connection supervisor (#C5), which keeps at most one ladder per route. */
 function disarmSecondaryRetry(entry: Secondary): void {
   cancelRouteRetry(secondaryRouteId(entry.scope))
+}
+
+/** The two facts the pooled liveness probe cannot know on its own: which entry
+ *  is still the registry's with an open socket, and which scopes have live work
+ *  (counted RPCs under-report a turn that is mid tool call). */
+const secondaryLivenessHost: SecondaryLivenessHost = {
+  liveScopes: () => g.config?.liveScopes?.(),
+  liveSocket: entry => g.secondaries.get(entry.scope) === entry && isOpen(entry.gateway)
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
@@ -1921,92 +1928,9 @@ const ACTIVE_GATEWAY_OPEN_WAIT_MS = 8_000
 // (#94769 prune ↔ redial race). Exported for the tests that age a socket past it.
 export const SECONDARY_MIN_LIFETIME_MS = 30_000
 
-// A deferred liveness re-probe for one entry: cleared when the probe is
-// answered, the socket is redialed (fresh streak), or the entry is disposed.
-function clearSecondaryLivenessReprobe(entry: Secondary): void {
-  if (entry.livenessReprobeTimer !== null) {
-    clearTimeout(entry.livenessReprobeTimer)
-    entry.livenessReprobeTimer = null
-  }
-}
-
-// Probe a live-in-use secondary instead of blind-closing it on a forced wake,
-// and close it only when the probe proves it not alive. A half-open TCP
-// connection (sleep/wake, silent network drop) reports connectionState
-// 'open' forever and fires no close event, so without this close an in-flight
-// request rides a dead transport until its per-call timeout — prompt.submit's
-// is 30 minutes. Closing arms the entry's ordinary reconnect backoff via its
-// onState('closed') handler; a healthy-but-busy backend answers the ping and
-// keeps its socket (#94769 review).
-function probeSecondaryLiveness(entry: Secondary): void {
-  void probeGatewayLiveness(entry.gateway).then(
-    () => {
-      entry.livenessProbeFailures = 0
-      clearSecondaryLivenessReprobe(entry)
-    },
-    (error: unknown) => {
-      // -32601 (method not found) = a version-skewed but HEALTHY backend that
-      // predates the ping method — the same compatibility carve-out the
-      // primary's probe makes in use-gateway-boot.
-      if (isMissingRpcMethod(error)) {
-        entry.livenessProbeFailures = 0
-        clearSecondaryLivenessReprobe(entry)
-
-        return
-      }
-
-      // The entry may have been pruned or redialed while the probe was
-      // pending; only the very same socket may be torn down.
-      if (g.secondaries.get(entry.scope) !== entry || !isOpen(entry.gateway)) {
-        return
-      }
-
-      // ONE missed ping is not proof of death: a live backend mid tool call
-      // can starve its event loop past the probe budget, and force-closing it
-      // feeds the backend's ws_orphan_reap, interrupting the valid turn
-      // (#94769 review). Apply the SAME streak policy as the primary's probe
-      // (decideLivenessForceClose): defer the first failure while work is
-      // in flight behind a bounded re-probe, close only when the streak is
-      // exhausted — or immediately when nothing is in flight to protect.
-      entry.livenessProbeFailures += 1
-
-      // Counted RPCs alone under-report in-flight work: prompt.submit returns
-      // before the turn ends, so a foreground turn mid tool call shows
-      // activeRequests 0. The registry's live-scope hook supplies the turn.
-      const liveScopes = g.config?.liveScopes?.()
-
-      const turnInFlight =
-        liveScopes && (liveScopes.has(entry.scope) || (!entry.connectionId && liveScopes.has(entry.profile))) ? 1 : 0
-
-      const decision = decideLivenessForceClose({
-        workingSessionCount: entry.activeRequests + turnInFlight,
-        consecutiveFailures: entry.livenessProbeFailures
-      })
-
-      if (!decision.close) {
-        if (entry.livenessReprobeTimer === null) {
-          entry.livenessReprobeTimer = setTimeout(() => {
-            entry.livenessReprobeTimer = null
-
-            // The entry may have been pruned or redialed while the re-probe
-            // waited; only the same open socket may be probed again.
-            if (g.secondaries.get(entry.scope) !== entry || !isOpen(entry.gateway)) {
-              return
-            }
-
-            probeSecondaryLiveness(entry)
-          }, LIVENESS_REPROBE_DELAY_MS)
-        }
-
-        return
-      }
-
-      entry.livenessProbeFailures = 0
-      clearSecondaryLivenessReprobe(entry)
-      entry.gateway.close()
-    }
-  )
-}
+// The pooled route's deferred liveness probe (streak, bounded re-probe,
+// compatibility carve-out) lives in ./gateway-secondary-liveness; the registry
+// only supplies the two facts it cannot know.
 
 // Recovery signal: nudge every live secondary back open. Power-resume/network
 // signals can force sockets that still report open to retire before redialing.
@@ -2039,7 +1963,7 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
       // a healthy-but-busy backend answers and keeps its socket; a dead
       // transport is closed and healed by the ordinary reconnect backoff.
       if (entry.activeRequests > 0 || pinnedOpen(entry) || foregroundPinned(entry)) {
-        probeSecondaryLiveness(entry)
+        probeSecondaryLiveness(entry, secondaryLivenessHost)
 
         continue
       }
