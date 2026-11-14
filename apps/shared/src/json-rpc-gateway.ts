@@ -202,6 +202,8 @@ export class JsonRpcGatewayClient {
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   /** Per-generation C1 phase stamps (t_c1f387b2); null while no generation is open. */
   private phaseWatch: SocketPhaseWatch | null = null
+  // #C3: code waiting for the generation's application-usable point (see whenApplicationUsable).
+  private applicationUsableWaiters: Array<() => void> = []
   private dialStartedAt = 0
   private readonly phaseHandlers = new Set<(phases: GatewaySocketPhases) => void>()
   private readonly options: Required<
@@ -509,6 +511,7 @@ export class JsonRpcGatewayClient {
     if (watch && watch.usableAt === null) {
       watch.usableAt = Date.now()
       this.maybeEmitSocketPhases()
+      this.settleApplicationUsableWaiters()
     }
   }
 
@@ -519,6 +522,46 @@ export class JsonRpcGatewayClient {
     if (watch && watch.replayRequested && watch.replaySettledAt === null) {
       watch.replaySettledAt = Date.now()
       this.maybeEmitSocketPhases()
+      this.settleApplicationUsableWaiters()
+    }
+  }
+
+  /**
+   * Resolve when the current socket generation is APPLICATION-USABLE: the first
+   * server response has arrived and every replay barrier opened at connect has
+   * settled (there was none to open). This is the composer's gate — frames flow,
+   * and reads parked behind the transcript barrier have been flushed — and it is
+   * exactly the condition C1's per-generation phase emission reports, so waiting
+   * here and reading the phases cannot disagree (#C3: post-connect list refreshes
+   * moved behind this seam instead of serializing the reconnect path).
+   *
+   * If the generation dies before reaching usable, waiters resolve on the next
+   * generation that does — a refresh that waits for a live socket is correct;
+   * one that fires onto a dead one would only fail its RPC anyway.
+   */
+  whenApplicationUsable(): Promise<void> {
+    if (this.isApplicationUsable()) {
+      return Promise.resolve()
+    }
+
+    return new Promise(resolve => {
+      this.applicationUsableWaiters.push(resolve)
+    })
+  }
+
+  private isApplicationUsable(): boolean {
+    const watch = this.phaseWatch
+
+    return watch !== null && watch.usableAt !== null && (!watch.replayRequested || watch.replaySettledAt !== null)
+  }
+
+  private settleApplicationUsableWaiters(): void {
+    if (!this.isApplicationUsable()) {
+      return
+    }
+
+    for (const resolve of this.applicationUsableWaiters.splice(0)) {
+      resolve()
     }
   }
 

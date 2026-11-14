@@ -448,6 +448,36 @@ export function attachPowerResumeRemoteRevalidation({
 }
 
 /**
+ * Reachability probe for the reconnect-path revalidations.
+ *
+ * Probe the cheap `/api/health` first: p50 6 ms / p90 8 ms against 0.18-1.9 s
+ * for `/api/status` on the same host (its payload resolves a gateway probe,
+ * topology, and a state.db session count on every call). This is why the
+ * pooled-dispatch gate switched first — see POOLED_REMOTE_DISPATCH_PROBE_TIMEOUT_MS.
+ *
+ * The `/api/status` fallback is kept for remotes that predate `/api/health`:
+ * without it every probe 404s, the failure streak burns, and a REACHABLE old
+ * backend is dropped on the floor and re-dialed forever. The dispatch gate and
+ * the boot probe (backend-health.ts) fall back the same way. The failure
+ * streak policy itself is the caller's and does not change here.
+ */
+async function probeRemoteLiveness<TConnection extends RemoteConnectionDescriptor>(
+  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>,
+  connection: TConnection,
+  timeoutMs: number
+): Promise<void> {
+  try {
+    await probe(connection, '/api/health', { timeoutMs })
+  } catch (healthError) {
+    if (!isMissingHealthEndpointError(healthError)) {
+      throw healthError
+    }
+
+    await probe(connection, '/api/status', { timeoutMs })
+  }
+}
+
+/**
  * Probe the cached primary remote connection and apply the failure policy.
  * The caller owns single-flight coordination; identity checks here ensure an
  * old async result cannot mutate or reset a replacement connection.
@@ -480,7 +510,7 @@ export async function revalidateRemoteConnection<TConnection extends RemoteConne
   const baseUrl = connection.baseUrl.replace(/\/+$/, '')
 
   try {
-    await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+    await probeRemoteLiveness(probe, connection, REMOTE_LIVENESS_TIMEOUT_MS)
 
     if (currentConnectionPromise() !== connectionPromise) {
       return { ok: true, rebuilt: false }
