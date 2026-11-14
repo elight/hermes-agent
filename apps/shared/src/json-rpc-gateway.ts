@@ -3,6 +3,7 @@ import {
   DEFAULT_HEARTBEAT_DEADLINE_MS,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   type GatewayRequestId,
+  type HelloHandshakeResult,
   JsonRpcRequestChannel,
   type JsonRpcRequestChannelOptions,
   type JsonRpcTransport,
@@ -148,6 +149,22 @@ interface SessionReplay {
   resolve: (valid: boolean) => void
 }
 
+/**
+ * One session's replay window, as either replay transport answers it: the ``session.events.since``
+ * result, or one ``client.hello`` ``per_session_replay`` entry (which adds ``session_id`` and the
+ * per-session ``error`` its owner reports when that window could not be answered at all).
+ */
+interface ReplayFrame {
+  epoch?: string
+  error?: string | null
+  events?: GatewayEvent[]
+  latest_seq?: number
+  replay_epoch?: unknown
+  session_id?: string
+  snapshot_required?: unknown
+  truncated?: boolean
+}
+
 /** One socket generation's phase stamps (absolute instants; durations are read off them). */
 interface SocketPhaseWatch {
   dialStartedAt: number
@@ -202,6 +219,21 @@ export class JsonRpcGatewayClient {
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   /** Per-generation C1 phase stamps (t_c1f387b2); null while no generation is open. */
   private phaseWatch: SocketPhaseWatch | null = null
+  /** The URL of the socket generation being dialed (what ``helloBackendUrl`` is compared against). */
+  private dialedUrl: string | null = null
+  /**
+   * The URL whose ``gateway.ready`` advertised ``resumed_handshake`` — the backend serves the folded
+   * handshake. Remembered so the NEXT reconnect can arm its replay for the fold (one request carrying
+   * every watermark) instead of racing it with one ``session.events.since`` per session. Null until a
+   * ready frame proves it, so every other backend keeps today's reconnect path unchanged.
+   */
+  private helloBackendUrl: string | null = null
+  /**
+   * Replay generation whose per-session requests wait for the ready frame because this reconnect was
+   * armed for the fold (``client.hello``) — the fold's answer fills the same hold, and a backend that
+   * answers it ``-32601`` (or whose ready does not advertise it after all) gets the fan-out instead.
+   */
+  private deferredReplay: number | null = null
   // #C3: code waiting for the generation's application-usable point (see whenApplicationUsable).
   private applicationUsableWaiters: Array<() => void> = []
   private dialStartedAt = 0
@@ -253,6 +285,11 @@ export class JsonRpcGatewayClient {
       // (#115251): streamed deltas are life; only a silent drop trips the
       // deadline.
       heartbeatLiveness: 'any-inbound',
+      helloHandshake: {
+        params: () => this.helloParams(),
+        onResult: result => this.applyHelloFold(result),
+        onUnsupported: () => this.fanOutDeferredReplay()
+      },
       onEvent: event => this.handleEvent(event),
       onFirstResponse: () => this.markUsable(),
       onHeartbeatFailure: error => this.invalidate(error.message),
@@ -290,6 +327,13 @@ export class JsonRpcGatewayClient {
     }
 
     this.dialStartedAt = Date.now()
+
+    if (this.dialedUrl !== wsUrl) {
+      // A different backend: what the previous one advertised says nothing about this one.
+      this.helloBackendUrl = null
+    }
+
+    this.dialedUrl = wsUrl
     this.setState('connecting')
 
     const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)
@@ -356,7 +400,7 @@ export class JsonRpcGatewayClient {
         this.channel.attach(transport)
         // Install session barriers before open listeners can start history
         // reads. Replay stays fire-and-forget; connect latency is unchanged.
-        this.fetchReplay()
+        this.startReplay()
         this.setState('open')
         resolve()
       }
@@ -620,6 +664,16 @@ export class JsonRpcGatewayClient {
         this.phaseWatch.readyAt = Date.now()
       }
 
+      // This backend serves the folded handshake: remember it so the NEXT reconnect arms its replay
+      // for the fold. The channel already opened this generation with `client.hello` (the frame this
+      // one answers is the ready frame it read) or, when the flag is absent, with the capabilities
+      // probe — in which case the windows the fold would have carried go out one session at a time.
+      if (event.payload?.resumed_handshake === true) {
+        this.helloBackendUrl = this.dialedUrl
+      } else {
+        this.fanOutDeferredReplay()
+      }
+
       if (event.payload?.heartbeat === true) {
         this.channel.startHeartbeat()
       }
@@ -737,24 +791,49 @@ export class JsonRpcGatewayClient {
   }
 
   /**
-   * After a reconnect, ask the gateway to replay every event newer than our
-   * per-session watermarks. Replayed frames go through the SAME dispatchEvent
-   * path as live frames, gated on seq to avoid dispatching duplicates.
-   * Best-effort: failures are swallowed (the next reconnect retries).
+   * Install this generation's replay barriers and start the fetch loop, unless the backend is known
+   * to serve the folded handshake.
+   *
+   * Every reconnect with watermarks arms the same per-session hold (live frames for those sessions
+   * park behind it, and each session's barrier resolves when its window lands). What differs is how
+   * the windows are ASKED for: a backend whose earlier ready frame advertised `resumed_handshake`
+   * gets the fold — the client's first frame carries the watermarks and the ONE answer carries every
+   * window — so the per-session requests wait for that ready frame instead of racing it. Any other
+   * backend (an older one, a transport with no session authority, a harness that sends no ready at
+   * all) keeps today's fire-and-forget fan-out from socket open.
    */
-  private fetchReplay(): void {
-    if (!this.options.replay || this.replayHold || this.lastSeenSeq.size === 0) {
+  private startReplay(): void {
+    const generation = this.armReplayHold()
+
+    if (generation === null) {
       return
     }
 
-    const replayGeneration = ++this.replayGeneration
-    // Park live frames for the sessions we're about to replay so a frame
-    // racing the replay response can't dispatch ahead of (or duplicate) the
-    // gap events. Sessions without watermarks are unaffected.
-    const entries = [...this.lastSeenSeq]
+    if (this.helloBackendUrl !== null && this.helloBackendUrl === this.dialedUrl) {
+      this.deferredReplay = generation
+
+      return
+    }
+
+    this.fetchHeldSessions(generation)
+  }
+
+  /**
+   * Arm the per-session hold and this generation's replay phase. Returns the replay generation the
+   * hold belongs to, or null when there is nothing to replay (replay off, no watermarks to resume
+   * from, or a hold already installed).
+   */
+  private armReplayHold(): number | null {
+    if (!this.options.replay || this.replayHold || this.lastSeenSeq.size === 0) {
+      return null
+    }
+
+    const generation = ++this.replayGeneration
+    // Park live frames for the sessions we're about to replay so a frame racing the answer can't
+    // dispatch ahead of (or duplicate) the gap events. Sessions without watermarks are unaffected.
     const hold = new Map<string, SessionReplay>()
 
-    for (const [sid] of entries) {
+    for (const [sid] of this.lastSeenSeq) {
       let resolve!: (valid: boolean) => void
 
       const promise = new Promise<boolean>(settle => {
@@ -765,13 +844,135 @@ export class JsonRpcGatewayClient {
     }
 
     this.replayHold = hold
+
     if (this.phaseWatch) {
       this.phaseWatch.replayRequested = true
     }
 
+    return generation
+  }
+
+  /** Fan out one `session.events.since` per held session: the reconnect replay without the fold. */
+  private fetchHeldSessions(generation: number): void {
     // A hung background session must not hold a ready session's transcript.
-    for (const [sid, lastSeen] of entries) {
-      void this.fetchSessionReplay(sid, lastSeen, replayGeneration)
+    for (const sid of [...(this.replayHold?.keys() ?? [])]) {
+      void this.fetchSessionReplay(sid, this.lastSeenSeq.get(sid) ?? 0, generation)
+    }
+  }
+
+  /**
+   * A reconnect was armed for the fold but it will not happen — the backend answered `client.hello`
+   * `-32601`, or its ready frame did not advertise the fold after all. Ask the SAME socket one session
+   * at a time; never redial (the reconnect owner would charge the whole dial for a fallback the open
+   * socket can absorb).
+   */
+  private fanOutDeferredReplay(): void {
+    const generation = this.deferredReplay
+
+    this.deferredReplay = null
+
+    if (generation !== null && this.replayGeneration === generation) {
+      this.fetchHeldSessions(generation)
+    }
+  }
+
+  /**
+   * The folded handshake's params: this client's capabilities, its per-session watermarks and the
+   * per-session epochs it holds — the qualifier today's one `session.events.since` per session sends
+   * as `replay_epoch` (a legacy endpoint refuses any other key, so it is sent only when we have one).
+   * Read as the request goes out, so it carries the live cursors exactly like the fan-out does.
+   */
+  private helloParams(): Record<string, unknown> {
+    const epochs = Object.fromEntries(this.replayEpochBySession)
+
+    return {
+      capabilities: { server_requests: true },
+      watermarks: Object.fromEntries(this.lastSeenSeq),
+      ...(this.replayEpoch ? { replay_epoch: this.replayEpoch } : {}),
+      ...(Object.keys(epochs).length > 0 ? { session_epochs: epochs } : {})
+    }
+  }
+
+  /**
+   * Apply the folded answer: every session's window through the SAME path the per-session replay
+   * uses (epoch rules, truncated skip, seq-gated dispatch), then release whatever is still parked.
+   * A window the owner did not answer for a session still releases that session's barrier, so a
+   * reader never waits on a window that will not come.
+   */
+  private applyHelloFold(result: HelloHandshakeResult): void {
+    const generation = this.deferredReplay
+
+    this.deferredReplay = null
+
+    if (generation === null || this.replayGeneration !== generation) {
+      return
+    }
+
+    const windows = Array.isArray(result.per_session_replay) ? result.per_session_replay : []
+
+    for (const entry of windows) {
+      if (this.replayGeneration !== generation) {
+        return
+      }
+
+      const window = (entry ?? {}) as ReplayFrame
+      const sid = typeof window.session_id === 'string' ? window.session_id : ''
+
+      if (sid) {
+        this.applyReplayWindow(sid, window, generation)
+      }
+    }
+
+    for (const sid of [...(this.replayHold?.keys() ?? [])]) {
+      if (this.replayGeneration !== generation) {
+        return
+      }
+
+      this.flushReplayHold(sid, generation)
+    }
+  }
+
+  /**
+   * Apply one session's replay window — the epoch rules, the truncated skip and the seq-gated
+   * dispatch every replay path shares. `error` is the owner's per-session refusal when the window
+   * could not be answered at all; nothing else in the window is trustworthy then.
+   */
+  private applyReplayWindow(sid: string, window: ReplayFrame, generation: number): void {
+    if (window.error) {
+      // `not_found` is an answer, not a lost request: the session is gone (deleted, pruned), nothing
+      // will ever replay under that cursor, and keeping it re-asks on every reconnect for the
+      // client's whole lifetime. Any other refusal keeps the cursor — the next reconnect re-asks.
+      if (window.error === 'not_found') {
+        this.lastSeenSeq.delete(sid)
+        this.replayEpochBySession.delete(sid)
+      }
+
+      return
+    }
+
+    if (this.applyReplayEpochs(sid, window)) {
+      return
+    }
+
+    if (window.truncated === true) {
+      this.skipTruncatedWindow(sid, window)
+
+      return
+    }
+
+    if (!Array.isArray(window.events)) {
+      return
+    }
+
+    for (const event of window.events) {
+      // Event handlers can synchronously invalidate and replace the socket.
+      if (this.replayGeneration !== generation) {
+        return
+      }
+
+      if (event?.type) {
+        this.dispatchIfNewer({ ...event, replayed: true })
+      }
     }
   }
 
@@ -788,14 +989,7 @@ export class JsonRpcGatewayClient {
       const sessionEpochBefore = this.replayEpochBySession.get(sid)
 
       // `open_requests` on the answer are re-delivered by the channel itself.
-      const result = await this.request<{
-        epoch?: string
-        events?: GatewayEvent[]
-        latest_seq?: number
-        replay_epoch?: unknown
-        snapshot_required?: unknown
-        truncated?: boolean
-      }>(
+      const result = await this.request<ReplayFrame>(
         'session.events.since',
         { session_id: sid, last_seen: lastSeen, ...(sessionEpochBefore ? { replay_epoch: sessionEpochBefore } : {}) },
         REPLAY_REQUEST_TIMEOUT_MS
@@ -808,37 +1002,7 @@ export class JsonRpcGatewayClient {
         return
       }
 
-      if (this.applyReplayEpochs(sid, result)) {
-        return
-      }
-
-      if (result?.truncated === true) {
-        // The ring evicted events between our watermark and its oldest
-        // retained seq: the tail has a hole (missing message prefix, tool
-        // state, or terminal event), so never paint it as the gap. Skip the
-        // whole window up to the server's head; the barrier then resolves
-        // true, which lets the waiting history reads (the reconnect backstop,
-        // #94779) resync from the authoritative transcript. Parked live
-        // frames newer than that head still dispatch in the finally below.
-        this.skipTruncatedWindow(sid, result)
-
-        return
-      }
-
-      if (!Array.isArray(result?.events)) {
-        return
-      }
-
-      for (const event of result.events) {
-        // Event handlers can synchronously invalidate and replace the socket.
-        if (this.replayGeneration !== replayGeneration) {
-          return
-        }
-
-        if (event?.type) {
-          this.dispatchIfNewer({ ...event, replayed: true })
-        }
-      }
+      this.applyReplayWindow(sid, result, replayGeneration)
     } catch (error) {
       // Replay is an optimization over lossy-reconnect; never surface errors. But the owner's
       // `not_found` is an answer, not a lost request: the session is gone (deleted, pruned),
@@ -1015,6 +1179,8 @@ export class JsonRpcGatewayClient {
     const hold = this.replayHold
     this.replayGeneration += 1
     this.replayHold = null
+    // A fold still waiting for its answer belongs to the revoked generation.
+    this.deferredReplay = null
 
     if (hold) {
       // Revoked barriers are released barriers: waiting reads proceed (or were abandoned).
@@ -1043,6 +1209,7 @@ export class JsonRpcGatewayClient {
       watch.emitted = true
       this.emitSocketPhases(watch)
     }
+
     this.socket = null
     this.channel.detach(error)
     this.setState('closed')
