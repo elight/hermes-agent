@@ -66,7 +66,16 @@ import {
 } from '@/store/gateway'
 import { secondaryReconnectsParked } from '@/store/gateway-park'
 import { $primaryGatewayRoute } from '@/store/gateway-primary-route'
-import { type GatewayReconnectOptions, reconnectGateway, registerGatewayReconnect } from '@/store/gateway-reconnect'
+import { reconnectGateway, registerGatewayReconnect } from '@/store/gateway-reconnect'
+import {
+  armRouteRetry,
+  cancelRouteRetry,
+  forgetRoute,
+  type GatewayReconnectOptions,
+  PRIMARY_ROUTE,
+  resetRouteLadder,
+  routeRetryPending
+} from '@/store/gateway-supervisor'
 import {
   $gatewaySwitching,
   beginGatewaySwitch,
@@ -137,15 +146,10 @@ const RECONNECT_ESCALATE_AFTER_MS = 300_000
 // turn is in flight the first timeout defers behind one bounded re-probe, so
 // only a STREAK of unanswered pings rebuilds the transport.
 
-// Renderer twin of the main process's POWER_RESUME_REVALIDATION_HOLDOFF_MS,
-// and — like it — a holdoff on DESTRUCTION only (#C2a). Wake signals are
-// frequent and overlapping (macOS fires resume then 'online' seconds apart;
-// Windows fires 'online' on any interface change), and each one used to be
-// allowed to close every open secondary socket: the #94769 flicker loop.
-// Coalescing that sweep is the whole job of this constant. The cheap half of a
-// wake — mint + dial a replacement primary — is idempotent and single-flights
-// in store/gateway-reconnect, so it is deliberately NOT gated by this.
-const WAKE_RECONNECT_HOLDOFF_MS = 15_000
+// The wake holdoff (how long the DESTRUCTIVE half of a wake stays quiet after
+// one runs) and the cheap half's single-flight both live with the rest of the
+// window's connection state machine now: store/gateway-supervisor.ts
+// (WAKE_SWEEP_HOLDOFF_MS / superviseWake). Nothing here gates a wake.
 
 // Bounded self-heal for a failed REMOTE boot (#82679): main classifies every
 // fault it can see (via getBootProgress().retryable); the renderer adds the one
@@ -384,11 +388,13 @@ export function useGatewayBoot({
     // switch and the renderer's own bounded retry (#82679).
     let bootFailed = false
     let reconnecting = false
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null
-    let reconnectAttempt = 0
+    // The primary's retry ladder — its timer and its attempt count — belongs to
+    // the window's connection supervisor (store/gateway-supervisor), which arms
+    // every pooled route's ladder too: one backoff implementation, at most one
+    // arming timer per route. This effect only decides WHEN to arm and to reset.
     // Wall-clock of the current socket's 'open'; null while not open.
-    // reconnectAttempt, reconnectFailingSince and escalated reset only once an
-    // open proves stable (isStableOpen), judged when the socket closes.
+    // The primary's ladder, reconnectFailingSince and escalated reset only once
+    // an open proves stable (isStableOpen), judged when the socket closes.
     let openedAt: number | null = null
     // Why the next post-open close happens, when this hook closes the socket itself
     // (friction telemetry): a liveness timeout is a real drop, a manual reconnect is not.
@@ -431,7 +437,7 @@ export function useGatewayBoot({
     let escalated = false
 
     const resetReconnectBackoff = () => {
-      reconnectAttempt = 0
+      resetRouteLadder(PRIMARY_ROUTE)
       reconnectFailingSince = null
       escalated = false
     }
@@ -470,12 +476,7 @@ export function useGatewayBoot({
     // detection story is the whole reconnect-under-1s question.
     const windowVisibility = (): 'hidden' | 'visible' => (document.visibilityState === 'hidden' ? 'hidden' : 'visible')
 
-    const clearReconnectTimer = () => {
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer)
-        reconnectTimer = null
-      }
-    }
+    const clearReconnectTimer = () => cancelRouteRetry(PRIMARY_ROUTE)
 
     // The #95327 probe (streak, bounded re-probe, decision) lives in
     // ./primary-liveness-probe; `ready` carries the park latch.
@@ -677,27 +678,19 @@ export function useGatewayBoot({
         secondaryReconnectsParked() ||
         primaryReauthError ||
         reconnecting ||
-        reconnectTimer !== null ||
+        routeRetryPending(PRIMARY_ROUTE) ||
         gatewayOpen() ||
         $gatewaySwitching.get()
       ) {
         return
       }
 
-      // Full-jitter exponential backoff (300ms base, 15s cap) so a gateway
-      // restart doesn't get redialed by every desktop client in lockstep —
-      // an immediate-retry reconnect storm can exhaust the gateway's file
-      // descriptors while it's still coming back up.
-      const delay = reconnectBackoffDelayMs(reconnectAttempt)
-      reconnectAttempt += 1
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null
-
-        // Armed before the park (#C2a): a hidden window dials no replacement.
-        if (!secondaryReconnectsParked()) {
-          void attemptReconnect(manual)
-        }
-      }, delay)
+      // The delay itself — full-jitter exponential backoff (300ms base, 15s cap)
+      // so a gateway restart doesn't get redialed by every desktop client in
+      // lockstep — is the supervisor's one ladder. It refuses a second timer for
+      // a route that already has one armed, and skips an armed run a park landed
+      // on (#C2a): a hidden window dials no replacement.
+      armRouteRetry(PRIMARY_ROUTE, () => void attemptReconnect(manual))
     }
 
     // OAuth session expired mid-reconnect: surface the actionable "sign in
@@ -716,7 +709,6 @@ export function useGatewayBoot({
 
     // ── Wake path (#C2a): see ./use-gateway-boot-wake ─────────────────────
     const wake = createWakeRecovery({
-      holdoffMs: WAKE_RECONNECT_HOLDOFF_MS,
       ready: () => !cancelled && bootCompleted && !$gatewaySwitching.get(),
       primary: () => gateway,
       // Read at dial time: primaryListeners is declared below, in this effect.
@@ -1338,7 +1330,7 @@ export function useGatewayBoot({
       // A window-lifecycle signal is not a manual recovery: dial a replacement
       // generation under the old socket instead of tearing anything down, and
       // retry a credential it never touched. This branch is what makes a wake
-      // single-flight — reconnectGateway coalesces concurrent callers.
+      // single-flight — the supervisor coalesces a signal burst onto one dial.
       if (options?.source === 'wake') {
         await wake.dial()
 
@@ -1404,6 +1396,10 @@ export function useGatewayBoot({
         profile: normalizeProfileKey($activeGatewayProfile.get()),
         activationEpoch: gatewayActivationEpoch()
       })
+    }, {
+      // What the supervisor's soft-signal rule reads: a plain focus on a socket
+      // that reports open must not churn it (#94769). Hard signals ignore this.
+      reportsOpen: gatewayOpen
     })
 
     // Registry lifecycle: a removed connection's secondaries must close NOW
@@ -1739,6 +1735,10 @@ export function useGatewayBoot({
       offSwitchLifecycle()
       endGatewaySwitch()
       clearReconnectTimer()
+      // The window's route goes with its socket: a later mount must start on
+      // the first rung of the ladder, not inherit a mid-recovery attempt count
+      // from the window that is gone (#83134's per-mount semantics).
+      forgetRoute(PRIMARY_ROUTE)
       clearBootRetryTimer()
       probe.cancelReprobe()
       offKeptGateways()

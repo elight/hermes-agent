@@ -39,6 +39,15 @@ import {
   sharedPrimaryRoute
 } from '@/store/gateway-shared-route'
 import type { Secondary } from '@/store/gateway-socket-entry'
+import {
+  armRouteRetry,
+  bumpGatewayActivationEpoch,
+  cancelRouteRetry,
+  forgetRoute,
+  resetRouteLadder,
+  routeRetryPending,
+  secondaryRouteId
+} from '@/store/gateway-supervisor'
 import { notifyError, RECOVERY_ACTIONS } from '@/store/notifications'
 import { markNativeNotifyBaseline } from '@/store/notify-baseline'
 import { setConnection, setGatewayState } from '@/store/session'
@@ -430,7 +439,9 @@ export function isActivePrimary(): boolean {
   return g.activeKey === g.primaryProfile
 }
 
-/** Changes on every active route selection, including same-profile source swaps. */
+/** Changes on every active route selection, including same-profile source swaps.
+ *  Written only by store/gateway-supervisor (#C5); read here and by the
+ *  components that key a render on it. */
 export function gatewayActivationEpoch(): number {
   return Number.isFinite($gatewayActivationEpoch.get()) ? $gatewayActivationEpoch.get() : 0
 }
@@ -547,14 +558,10 @@ export function reportPrimaryGatewayState(state: ConnectionState): void {
 }
 
 function setActive(profile: string): void {
-  const activationEpoch = beginGatewayActivation()
-  applyActive(profile, activationEpoch)
-}
-
-function beginGatewayActivation(): number {
-  $gatewayActivationEpoch.set(gatewayActivationEpoch() + 1)
-
-  return $gatewayActivationEpoch.get()
+  // The activation epoch is the supervisor's to advance (#C5). It is the same
+  // owner that arms the ladders and takes the wake, so "the active route moved"
+  // is stamped by exactly one writer.
+  applyActive(profile, bumpGatewayActivationEpoch())
 }
 
 function applyActive(profile: string, activationEpoch: number): boolean {
@@ -604,11 +611,10 @@ function publishActiveConnection(connection: HermesConnection): void {
   }
 }
 
-function clearTimer(entry: Secondary): void {
-  if (entry.reconnectTimer !== null) {
-    clearTimeout(entry.reconnectTimer)
-    entry.reconnectTimer = null
-  }
+/** Disarm this entry's armed retry. The timer itself belongs to the window's
+ *  connection supervisor (#C5), which keeps at most one ladder per route. */
+function disarmSecondaryRetry(entry: Secondary): void {
+  cancelRouteRetry(secondaryRouteId(entry.scope))
 }
 
 async function openSecondary(entry: Secondary): Promise<void> {
@@ -758,13 +764,13 @@ async function openSecondary(entry: Secondary): Promise<void> {
     if (isGatewayReauthRequired(error) && g.secondaries.get(entry.scope) === entry) {
       g.reauthFailures.set(entry.scope, { connectionId: entry.connectionId, error })
       entry.wantOpen = false
-      clearTimer(entry)
+      disarmSecondaryRetry(entry)
     }
 
     // Parked here, where every dial lands, so not even the first scheduled redial runs.
     if (error instanceof UnservedProfileError) {
       entry.wantOpen = false
-      clearTimer(entry)
+      disarmSecondaryRetry(entry)
     }
 
     throw error
@@ -857,18 +863,22 @@ async function openSecondaryForRequest(entry: Secondary, spawnPriority: SpawnPri
 }
 
 function scheduleReconnect(entry: Secondary): void {
-  if (g.config?.routesParked?.() || entry.reconnecting || entry.reconnectTimer !== null || !entry.wantOpen) {
+  if (
+    g.config?.routesParked?.() ||
+    entry.reconnecting ||
+    routeRetryPending(secondaryRouteId(entry.scope)) ||
+    !entry.wantOpen
+  ) {
     return
   }
 
-  // Full-jitter exponential backoff — same shape (and same reason: avoid a
-  // reconnect storm against a restarting gateway) as the primary's.
-  const delay = reconnectBackoffDelayMs(entry.reconnectAttempt)
-  entry.reconnectAttempt += 1
-  entry.reconnectTimer = setTimeout(() => {
-    entry.reconnectTimer = null
-    void reconnectSecondary(entry)
-  }, delay)
+  // The delay — full-jitter exponential backoff, the same one the primary's
+  // ladder uses, for the same reason (avoid a reconnect storm against a
+  // restarting gateway) — is armed on the window's connection supervisor, which
+  // keeps at most ONE timer per route (#C5). The entry no longer owns a
+  // `setTimeout`: a ladder the entry could not be disarmed from outside was how
+  // a wake signal's nudge and an entry's own backoff became two redial families.
+  armRouteRetry(secondaryRouteId(entry.scope), () => void reconnectSecondary(entry))
 }
 
 async function reconnectSecondary(entry: Secondary): Promise<void> {
@@ -959,8 +969,6 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     offEvent: () => {},
     offRequest: () => {},
     offState: () => {},
-    reconnectTimer: null,
-    reconnectAttempt: 0,
     livenessProbeFailures: 0,
     livenessReprobeTimer: null,
     stalledDials: 0,
@@ -989,12 +997,12 @@ function createSecondary(profile: string, connectionId: null | string = null): S
     if (state === 'open') {
       entry.stalledDials = 0
       entry.openedAt = Date.now()
-      clearTimer(entry)
+      disarmSecondaryRetry(entry)
     } else if (state === 'closed' || state === 'error') {
       // Same stable-open rule as the primary (#83134): an accept-then-close socket
       // is a failed attempt, so the ladder resets only after a socket that lived.
       if (isStableOpen(entry.openedAt)) {
-        entry.reconnectAttempt = 0
+        resetRouteLadder(secondaryRouteId(entry.scope))
         g.dialFailures.delete(scope)
       } else if (entry.openedAt !== null) {
         recordDialFailure(entry)
@@ -1719,7 +1727,7 @@ export async function ensureGatewayForAgent(
     return !signal?.aborted
   }
 
-  const activationEpoch = beginGatewayActivation()
+  const activationEpoch = bumpGatewayActivationEpoch()
 
   if (await ridesPrimaryBackend(connectionId, profile)) {
     // A retained primary can be open while the foreground still points at a
@@ -1746,8 +1754,8 @@ export async function ensureGatewayForAgent(
   entry.activationLeaseUntil = Date.now() + ACTIVATION_LEASE_MS
 
   if (!isOpen(entry.gateway)) {
-    clearTimer(entry)
-    entry.reconnectAttempt = 0
+    disarmSecondaryRetry(entry)
+    resetRouteLadder(secondaryRouteId(entry.scope))
 
     try {
       await openSecondary(entry)
@@ -1790,7 +1798,7 @@ export async function ensureGatewayForAgent(
 // primary is a no-op fast path. Background sockets are never closed here.
 export async function ensureGatewayForProfile(profile: string): Promise<void> {
   const key = normKey(profile)
-  const activationEpoch = beginGatewayActivation()
+  const activationEpoch = bumpGatewayActivationEpoch()
 
   if (key === g.primaryProfile) {
     applyActive(key, activationEpoch)
@@ -1823,8 +1831,8 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
 
   try {
     if (!isOpen(entry.gateway)) {
-      clearTimer(entry)
-      entry.reconnectAttempt = 0
+      disarmSecondaryRetry(entry)
+      resetRouteLadder(secondaryRouteId(entry.scope))
 
       try {
         await openSecondary(entry)
@@ -2039,8 +2047,8 @@ export function reconnectSecondaryGateways({ forceOpenSockets = false }: { force
       entry.gateway.close()
     }
 
-    entry.reconnectAttempt = 0
-    clearTimer(entry)
+    resetRouteLadder(secondaryRouteId(entry.scope))
+    disarmSecondaryRetry(entry)
     void reconnectSecondary(entry)
   }
 }
@@ -2072,7 +2080,10 @@ function disposeSecondary(entry: Secondary): void {
 
   entry.wantOpen = false
   entry.pendingConnectionRedial = false
-  clearTimer(entry)
+  // Forget the route outright: the supervisor's ladder entry must not outlive
+  // the socket it was arming for, or a re-created entry for the same scope
+  // would inherit a stale attempt count.
+  forgetRoute(secondaryRouteId(entry.scope))
   clearSecondaryLivenessReprobe(entry)
   entry.offEvent()
   entry.offRequest()
