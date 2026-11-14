@@ -798,10 +798,13 @@ def detect_stale_running(
             if owner_reclaim_blocked_after_kill(conn, tid, signalled=bool(termination.get("termination_attempted"))):
                 continue
             retry_status = _kb._retry_status_for_run(conn, tid)
+            # The close books no error of its own (deliberately uncounted), so
+            # it clears the failure text it did not write: an earlier quota
+            # stamp must not go live under a ``stale`` latest run (t_f7f7eef4).
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_failure_error = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
                 (retry_status, tid, row["claim_lock"]),
@@ -868,10 +871,13 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
         with _kb.write_txn(conn):
             if owner_reclaim_blocked(conn, tid):
                 continue
+            # The reconcile books no error of its own, so it clears the failure
+            # text it did not write: an earlier quota stamp must not go live
+            # under a ``reclaimed`` latest run (t_f7f7eef4).
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
-                "last_heartbeat_at = NULL "
+                "last_heartbeat_at = NULL, last_failure_error = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND claim_expires IS ?",
                 (tid, row["claim_lock"], row["claim_expires"]),
@@ -1550,8 +1556,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth text the latest ended run still owns; a successful handoff
-    supersedes it), then for the ready lane only ``"recent_success"`` (completed
+    (quota/auth text the latest ended run still owns; a successful handoff or a
+    reclaim close supersedes it), then for the ready lane only
+    ``"recent_success"`` (completed
     run within the window, unless a re-queue event arrived after it — a
     deliberate re-run) and ``"active_pr"`` (PR URL in a recent comment; unless a
     handoff event followed it: the named profile must work on that PR). The
@@ -1599,8 +1606,9 @@ def check_respawn_guard(
 
     # 2. Quota / auth blocker: retrying immediately will not help. The text is
     #    only a blocker while the latest ended run still owns it — a successful
-    #    handoff supersedes it — and a crash's captured output is context, not a
-    #    diagnosis. Both live in kanban_db_failure_text.blocks_respawn.
+    #    handoff or a reclaim close supersedes it — and a crash's captured
+    #    output is context, not a diagnosis. Both live in
+    #    kanban_db_failure_text.blocks_respawn.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
     if blocks_respawn(err, latest_outcome):
