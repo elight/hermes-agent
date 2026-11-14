@@ -90,25 +90,32 @@ export function apiJsonFetch(
           return
         }
 
+        // Node coerces a null header value to the literal "null" on the wire
+        // (the OAuth bearer leg passes token=null there); undefined throws
+        // ERR_HTTP_INVALID_HEADER_VALUE. OutgoingHttpHeaders models neither,
+        // so the object is typed one step wider and cast at the boundary —
+        // the runtime object is unchanged byte-for-byte.
+        const headers: Record<string, string | null> = {
+          ...deps.remoteHeaders(url),
+          ...(options.headers || {}),
+          'Content-Type': contentType,
+          ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
+          ...(options.ifNoneMatch ? { 'If-None-Match': options.ifNoneMatch } : {}),
+          // RFC 8252 native flow authenticates the gated gateway with a bearer
+          // token instead of the loopback session-token header. When
+          // ``options.bearer`` is set we put the bearer token in the Authorization header
+          // the gateway's OAuth gate verifies it via the provider stack with
+          // no cookie involved.
+          ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
+          ...(body ? { 'Content-Length': String(body.length) } : {})
+        }
+
         const req = client.request(
           parsed,
           {
             agent,
             method: options.method || 'GET',
-            headers: {
-              ...deps.remoteHeaders(url),
-              ...(options.headers || {}),
-              'Content-Type': contentType,
-              ...(nativeHeaders || { 'X-Hermes-Session-Token': token }),
-              ...(options.ifNoneMatch ? { 'If-None-Match': options.ifNoneMatch } : {}),
-              // RFC 8252 native flow authenticates the gated gateway with a bearer
-              // token instead of the loopback session-token header. When
-              // ``options.bearer`` is set we send Authorization: Bearer ***
-              // the gateway's OAuth gate verifies it via the provider stack with
-              // no cookie involved.
-              ...(options.bearer ? { Authorization: `Bearer ${options.bearer}` } : {}),
-              ...(body ? { 'Content-Length': String(body.length) } : {})
-            }
+            headers: headers as unknown as http.OutgoingHttpHeaders
           },
           res => {
             const chunks: Buffer[] = []

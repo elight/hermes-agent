@@ -43,7 +43,7 @@ import {
 import type { Session } from 'electron'
 
 import { type ActiveRuntimeState, classifyActiveRuntime } from './active-runtime-state'
-import { buildConditionalEnvelope, unwrapConditionalEnvelope } from './api-conditional'
+import { conditionalResultForRenderer } from './api-conditional'
 import { HERMES_API_EXPECTED_404 } from './api-expected-404'
 import { apiJsonFetch } from './api-json-fetch'
 import {
@@ -561,7 +561,7 @@ import {
 } from './secret-storage-policy'
 import { selectPathsDialogProperties } from './select-paths-dialog'
 import { selectRunnableBinary } from './select-runnable-binary'
-import { createConditionalReadCache } from './session-conditional-reads'
+import { createConditionalReadCache, normalizeConditionalResult } from './session-conditional-reads'
 import {
   buildInstanceWindowUrl,
   buildSessionWindowUrl,
@@ -15477,8 +15477,12 @@ async function remoteSessionList(profile, searchParams) {
     conditional: { cache: sessionConditionalCache }
   })
 
+  // An all-304 read hands back the derived cache's OWN value, so the rows
+  // must be tagged on copies: a non-idempotent tagger must never be able to
+  // mutate cached rows (the tag below writes `profile`/`is_default_profile`
+  // in place today, which only happens to be safe because it is idempotent).
   const rows = tagRemoteSessionRows(
-    rowsOf(data),
+    rowsOf(data).map((row: unknown) => (row && typeof row === 'object' ? { ...row } : row)),
     remoteProfileQueryScope(profile, sshOverride?.remoteProfile) || profile
   )
 
@@ -15693,10 +15697,10 @@ async function dispatchRegistryApiRequest(
     ...(conditional ? { conditional: true, ...(request?.ifNoneMatch ? { ifNoneMatch: request.ifNoneMatch } : {}) } : {})
   })
 
-  // Post-processing sees the payload's data, not the conditional envelope;
-  // the envelope is re-wrapped below for the renderer.
-  const payload = conditional ? unwrapConditionalEnvelope(raw) : null
-  const response = payload ? payload.data : raw
+  // The transport resolves the plain { data, status, etag }; post-processing
+  // (preference recording, row tagging) sees the payload's data, and the
+  // renderer gets the branded envelope (conditionalResultForRenderer).
+  const response = conditional ? normalizeConditionalResult(raw).data : raw
 
   desktopProfilePreferences.afterProfileRequest(registryConnectionId, request, response, connection.mode)
 
@@ -15704,8 +15708,8 @@ async function dispatchRegistryApiRequest(
     return response
   }
 
-  return conditional && payload
-    ? buildConditionalEnvelope({ ...payload, data: tagRegistrySessionResponse(requestPath, response, registryConnectionId) })
+  return conditional
+    ? conditionalResultForRenderer(raw, data => tagRegistrySessionResponse(requestPath, data, registryConnectionId))
     : tagRegistrySessionResponse(requestPath, response, registryConnectionId)
 }
 
@@ -15830,10 +15834,9 @@ async function handleHermesApiRequest(request) {
     throw error
   }
 
-  // Preference recording sees the payload's data, not the conditional
-  // envelope; the envelope is re-wrapped below for the renderer.
-  const payload = conditional ? unwrapConditionalEnvelope(response) : null
-  const data = payload ? payload.data : response
+  // Preference recording sees the payload's data; the renderer gets the
+  // branded envelope (conditionalResultForRenderer).
+  const data = conditional ? normalizeConditionalResult(response).data : response
 
   try {
     desktopProfilePreferences.afterProfileRequest(null, request, data, connection.mode)
@@ -15841,7 +15844,7 @@ async function handleHermesApiRequest(request) {
     await profileRename?.complete()
   }
 
-  return conditional && payload ? buildConditionalEnvelope({ ...payload, data }) : response
+  return conditional ? conditionalResultForRenderer(response) : response
 }
 
 // A renderer conditional list read — the ONE hermes:api shape that travels as

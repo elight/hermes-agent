@@ -520,12 +520,16 @@ async function fetchSessionRowsInPages(
     const seenIds = new Set<string>()
     const backfilledIds = new Set<string>()
 
-    pages.forEach(({ data: page, pageLimit }, pageIndex) => {
+    // Running page start: the window bound for page i is its own offset, so
+    // accumulate instead of re-summing every earlier page per iteration.
+    let pageStart = requestedOffset
+
+    pages.forEach(({ data: page, pageLimit }) => {
       const pageRows = rowsOf(page)
       const total = nonNegativeNumber(page && typeof page === 'object' ? (page as { total?: unknown }).total : null)
 
       const windowedCount =
-        total !== null ? Math.min(pageLimit, Math.max(0, total - (requestedOffset + pages.slice(0, pageIndex).reduce((sum, p) => sum + p.pageLimit, 0)))) : Math.min(pageLimit, pageRows.length)
+        total !== null ? Math.min(pageLimit, Math.max(0, total - pageStart)) : Math.min(pageLimit, pageRows.length)
 
       for (const row of pageRows.slice(0, windowedCount)) {
         const id = profileSessionId(row)
@@ -555,6 +559,8 @@ async function fetchSessionRowsInPages(
 
         backfilled.push(row)
       }
+
+      pageStart += pageLimit
     })
 
     for (const row of backfilled) {
@@ -1150,13 +1156,16 @@ export async function fetchRemoteProfileSessions(
   const seenIds = new Set<string>()
   const backfilledIds = new Set<string>()
 
-  pages.forEach(({ data: page, pageLimit }, pageIndex) => {
+  // Running page start: see the registry fan-out above — the window bound is
+  // each page's own offset, accumulated, not re-summed per iteration.
+  let pageStart = requestedOffset
+
+  pages.forEach(({ data: page, pageLimit }) => {
     const total = nonNegativeNumber(page.total)
     const pageRows = rowsOf(page)
-    const pageOffsetHere = requestedOffset + pages.slice(0, pageIndex).reduce((sum, p) => sum + p.pageLimit, 0)
 
     const windowedCount =
-      total !== null ? Math.min(pageLimit, Math.max(0, total - pageOffsetHere)) : Math.min(pageLimit, pageRows.length)
+      total !== null ? Math.min(pageLimit, Math.max(0, total - pageStart)) : Math.min(pageLimit, pageRows.length)
 
     // /api/sessions appends pinned rows that fall outside the requested
     // window. Keep those aside until all ordinary pages have been joined so
@@ -1189,6 +1198,8 @@ export async function fetchRemoteProfileSessions(
 
       backfilled.push(row)
     }
+
+    pageStart += pageLimit
   })
 
   for (const row of backfilled) {

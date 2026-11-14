@@ -10,6 +10,8 @@
 // resolves the plain body — the renderer detects the missing brand and falls
 // back to today's unconditional behavior (the capability gate).
 
+import { normalizeConditionalResult } from './session-conditional-reads'
+
 const HERMES_API_CONDITIONAL = '__hermesConditional__'
 
 export interface HermesApiConditionalPayload {
@@ -44,12 +46,27 @@ export function buildConditionalEnvelope(payload: HermesApiConditionalPayload): 
   return { [HERMES_API_CONDITIONAL]: true, ...payload }
 }
 
-// Main-side unwrap: the post-processing steps (profile-preference recording,
-// registry row tagging) must see the payload's data, not the envelope.
-export function unwrapConditionalEnvelope(value: unknown): HermesApiConditionalPayload | null {
-  return isConditionalEnvelope(value)
-    ? { etag: value.etag, status: value.status, data: value.data }
-    : null
+// The main-side post-processing both `hermes:api` handler paths run when a
+// conditional list read resolves (main.ts is too heavy to load in a unit
+// test, so the seam is tested through this helper): the transport
+// (api-json-fetch) resolves the PLAIN `{ data, status, etag }` — the brand is
+// applied here, exactly once, on the main side, and the renderer
+// capability-gates on it. The OAuth cookie leg resolves the plain parsed body
+// instead (it cannot capture status/ETag); normalization reads that as a
+// 200 with no validator, so the renderer simply never revalidates it.
+// `transformData` is the per-route post-processing (registry row tagging)
+// that must run on the payload's data before it is wrapped.
+export function conditionalResultForRenderer(
+  value: unknown,
+  transformData?: (data: unknown) => unknown
+): HermesApiConditionalEnvelope {
+  const result = normalizeConditionalResult(value)
+
+  return buildConditionalEnvelope({
+    etag: result.etag,
+    status: result.status,
+    data: transformData ? transformData(result.data) : result.data
+  })
 }
 
 export { HERMES_API_CONDITIONAL }
