@@ -1,5 +1,6 @@
 import {
   type ConnectionState,
+  type GatewayClientOptions,
   type GatewayEvent,
   type GatewayEventName,
   JsonRpcGatewayClient,
@@ -579,8 +580,15 @@ export class HermesGateway extends JsonRpcGatewayClient {
     }
   }
 
-  constructor() {
+  /**
+   * Options are the shared client's; the desktop fills in its own contract for everything it owns
+   * (error copy, monotonic request ids, the native socket). `beforeOpenRequests` is the one option a
+   * caller passes: the #C6 gate that holds replayed `open_requests` until this reconnect's
+   * re-resumes are out (see `store/reconnect-resume.ts`).
+   */
+  constructor(options: GatewayClientOptions = {}) {
     super({
+      ...options,
       closedErrorMessage: 'Hermes gateway connection closed',
       connectErrorMessage: 'Could not connect to Hermes gateway',
       createRequestId: nextId => nextId,

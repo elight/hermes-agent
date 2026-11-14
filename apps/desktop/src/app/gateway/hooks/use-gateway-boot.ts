@@ -3,7 +3,6 @@ import {
   isGatewayReauthRequired,
   isGatewayWebSocketUrl,
   isStableOpen,
-  JSON_RPC_METHOD_NOT_FOUND,
   reconnectBackoffDelayMs
 } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
@@ -90,6 +89,10 @@ import {
   normalizeProfileKey,
   refreshActiveProfile
 } from '@/store/profile'
+import {
+  beginReconnectResumeOnSocket,
+  reconnectResumeGate
+} from '@/store/reconnect-resume'
 import { requestBackendRestart } from '@/store/recovery-requests'
 import {
   $activeSessionId,
@@ -105,8 +108,6 @@ import {
 } from '@/store/session'
 import { stampSecondaryProfileOwner } from '@/store/session-event-provenance'
 import {
-  foregroundSessionScopes,
-  forgetProfileOnlyRuntimeOwners,
   reconcileBusyStatesOnReconnect,
   recordSessionEventScope,
   resetTileRuntimeBindings
@@ -115,7 +116,8 @@ import { warnIfTerminalBackendUnavailable } from '@/store/terminal-backend-warni
 import { isPeerInstanceWindow, windowProfileOverride } from '@/store/windows'
 
 import { stashGatewaySurvivor, survivorIsStale, takeGatewaySurvivor } from './gateway-hmr-survivor'
-import { bindKeptGatewayRecompute, liveWorkScopes } from './gateway-keepset'
+import { bindKeptGatewayRecompute } from './gateway-keepset'
+import { createGatewayRegistryWiring } from './gateway-registry-wiring'
 import { createPrimaryLivenessProbe } from './primary-liveness-probe'
 import { notifyPrimaryReauth } from './primary-reauth-notice'
 import { createPrimaryRetryLadder, type PrimaryRetryGate } from './primary-retry-ladder'
@@ -572,11 +574,9 @@ export function useGatewayBoot({
       manual?: { profile: string; activationEpoch: number },
       { keepTurnClaims = false }: { keepTurnClaims?: boolean } = {}
     ) => {
-      // A respawned backend re-mints (recycles) runtime ids, so any tile's
-      // bound runtime id is now stale — drop them so each tile re-resumes.
-      // A legacy remote primary has no registry identity to scope by; fall
-      // back to preserving only Bot runtimes owned by provably-live
-      // secondaries so the restarted backend's own tiles still rebind.
+      // A respawned backend re-mints (recycles) runtime ids, so any tile's bound runtime id is now
+      // stale — drop them so each tile re-resumes. A legacy remote primary has no registry identity
+      // to scope by; fall back to live secondaries so the restarted backend's own tiles still rebind.
       const primaryConnectionId = primaryRuntimeConnectionId(conn)
       resetTileRuntimeBindings(
         manual && primaryConnectionId
@@ -589,11 +589,11 @@ export function useGatewayBoot({
       // the same lifetime as the runtime bindings it shadows.
       resetBackgroundPollingGuard()
 
-      // Same staleness, other half: pre-reconnect busy flags are keyed by
-      // those dead runtime ids and would never receive their terminal
-      // busy:false — clear them or the sidebar running arc lies forever
-      // (#53902/#73082). A genuinely live turn re-asserts busy on its next
-      // post-reconnect event.
+      // #C6: the socket is back, the runtimes behind it are not
+      beginReconnectResumeOnSocket()
+
+      // Same staleness, other half: pre-reconnect busy flags are keyed by those dead runtime ids and
+      // would never receive their terminal busy:false (#53902/#73082); a live turn re-asserts it.
       // A manual retry may finish after the user has moved to another route.
       if (!manual || (isActivePrimary() && gatewayActivationEpoch() === manual.activationEpoch)) {
         if (!keepTurnClaims) {
@@ -1077,8 +1077,9 @@ export function useGatewayBoot({
     // `let`: the wake path REPLACES the primary generation in place (#C2a,
     // adoptPrimaryGeneration), and every closure below must keep reading the
     // CURRENT primary — that is what keeps one window owned by exactly one live
-    // socket across a wake.
-    let gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway()
+    // socket across a wake. Every primary generation installs the #C6 gate that
+    // holds replayed open_requests until this reconnect's re-resumes are out.
+    let gateway = adoptedFromHmr ? survivor!.gateway : new HermesGateway({ beforeOpenRequests: reconnectResumeGate })
 
     // Every socket this window owns (the primary below, every registry
     // secondary via onEvent) funnels through this one gate before any store
@@ -1102,69 +1103,15 @@ export function useGatewayBoot({
     // Record each event's source scope first: registry-tagged events feed the
     // (connectionId, profile) keep-set so two sources exposing the same
     // profile name (every source has a 'default') can't collide.
-    configureGatewayRegistry({
-      onServerRequest: request => {
-        if (!callbacksRef.current.handleServerRequest(request)) {
-          request.fail(JSON_RPC_METHOD_NOT_FOUND, `Hermes Desktop cannot answer ${request.method}`)
-        }
-      },
-      // The primary socket has no secondary entry to carry registry identity.
-      // Electron's published active descriptor is authoritative after boot;
-      // a true legacy primary has no connectionId and remains unqualified.
-      activeConnectionId: () => $connection.get()?.connectionId ?? null,
-      // Every dispose path in the registry (live-work pruner AND the
-      // refcount-0 request leases) spares a socket a mounted tile, the
-      // primary thread or a just-created session's owner hold is bound to
-      // (#93892).
-      foregroundScopes: foregroundSessionScopes,
-      // Defined further down the effect body; read at call time, never during boot.
-      liveScopes: () => liveWorkScopes(),
-      // The registry's two dial points read this (#C2a): a parked window (hidden,
-      // ladders standing down) opens no pool socket at all.
-      routesParked: secondaryReconnectsParked,
-      onLocalProfileRetired: forgetProfileOnlyRuntimeOwners,
-      onActiveConnectionChanged: publish,
-      // Keep $activeGatewayProfile in lockstep with the registry's OWN record
-      // of which profile the active socket serves. The registry is the only
-      // party that sees eviction fallbacks (connection removal,
-      // profile delete → primary); before this mirror those fallbacks moved
-      // the SOCKET back to the primary while the profile atom kept naming the
-      // evicted bot. ensureGatewayProfile's "already active" fast path then
-      // trusted the stale atom and skipped the re-swap, so every
-      // session-scoped RPC for that bot went out on the primary socket — the
-      // #89206 "Waking up… → retries gave up" wake failure, while the bot's
-      // own backend sat healthy and idle.
-      onActiveRouteChanged: profile => {
-        const key = normalizeProfileKey(profile)
-
-        if (normalizeProfileKey($activeGatewayProfile.get()) !== key) {
-          $activeGatewayProfile.set(key)
-        }
-      },
-      onEvent: deliverGatewayEvent,
-      onActiveConnectionInvalidated: (fallbackProfile, invalidationEpoch) => {
-        $activeGatewayProfile.set(fallbackProfile)
-        // Bounded like every other getConnection() call in this file (#93454):
-        // an eviction fallback (connection removal, profile delete)
-        // must not latch the profile atom to a connection that never resolves
-        // if the main-process IPC round-trip wedges.
-        void withTimeout(
-          desktop.getConnection(fallbackProfile),
-          RECONNECT_ATTEMPT_TIMEOUT_MS,
-          'Timed out resolving the fallback gateway connection'
-        )
-          .then(connection => {
-            if (!cancelled && gatewayActivationEpoch() === invalidationEpoch) {
-              publish(connection)
-            }
-          })
-          .catch(() => {
-            if (!cancelled && gatewayActivationEpoch() === invalidationEpoch) {
-              publish(null)
-            }
-          })
-      }
-    })
+    configureGatewayRegistry(
+      createGatewayRegistryWiring({
+        callbacks: callbacksRef,
+        deliverGatewayEvent,
+        desktop,
+        isCancelled: () => cancelled,
+        publish
+      })
+    )
 
     const offActiveGatewayReauth = $gateway.listen(syncPrimaryReauthError)
     const offActiveStateReauth = $gatewayState.listen(syncPrimaryReauthError)

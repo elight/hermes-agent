@@ -29,6 +29,12 @@ export interface GatewayClientOptions {
   onUnhandledRequest?: JsonRpcRequestChannelOptions['onUnhandledRequest']
   /** An error frame no request owns (the backend's parse-error reply). */
   onUncorrelatedError?: JsonRpcRequestChannelOptions['onUncorrelatedError']
+  /**
+   * Ordering gate for the `open_requests` an answer re-delivers (#C6): the owner's re-resume of the
+   * sessions behind them goes on the wire first, so a card the user answers has a runtime to land
+   * on. Never on the critical path — `whenApplicationUsable` does not wait on it.
+   */
+  beforeOpenRequests?: JsonRpcRequestChannelOptions['beforeOpenRequests']
   /** Return true to intercept the default closed-state transition. */
   onSocketClose?: (event: { code: number }) => boolean | void
   /**
@@ -241,12 +247,12 @@ export class JsonRpcGatewayClient {
   private readonly options: Required<
     Omit<
       GatewayClientOptions,
-      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory'
+      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory' | 'beforeOpenRequests'
     >
   > &
     Pick<
       GatewayClientOptions,
-      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory'
+      'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'onSocketPhases' | 'socketFactory' | 'beforeOpenRequests'
     >
 
   /**
@@ -259,6 +265,7 @@ export class JsonRpcGatewayClient {
 
   constructor(options: GatewayClientOptions = {}) {
     this.options = {
+      beforeOpenRequests: options.beforeOpenRequests,
       closedErrorMessage: options.closedErrorMessage ?? 'WebSocket closed',
       connectErrorMessage: options.connectErrorMessage ?? 'WebSocket connection failed',
       connectTimeoutMs: options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS,
@@ -277,6 +284,7 @@ export class JsonRpcGatewayClient {
       socketFactory: options.socketFactory
     }
     this.channel = new JsonRpcRequestChannel({
+      beforeOpenRequests: this.options.beforeOpenRequests,
       createRequestId: this.options.createRequestId,
       desktopLocal: () => this.isDesktopLocal(),
       heartbeatDeadlineMs: this.options.heartbeatDeadlineMs,
@@ -743,6 +751,17 @@ export class JsonRpcGatewayClient {
   /** Test/telemetry hook: current last-seen seq map snapshot. */
   getSeqWatermarks(): Record<string, number> {
     return Object.fromEntries(this.lastSeenSeq)
+  }
+
+  /**
+   * Forget one session's replay cursor and its epoch qualifier (host-side terminal verdict: the
+   * gateway does not have this session — `session.resume` answered `not_found`, so nothing will ever
+   * replay under that cursor). Without this a reconnect re-asks for a window that cannot exist, for
+   * the client's whole lifetime. Mirrors what the `not_found` branch of a replay answer does.
+   */
+  forgetReplayCursor(sessionId: string): void {
+    this.lastSeenSeq.delete(sessionId)
+    this.replayEpochBySession.delete(sessionId)
   }
 
   /**

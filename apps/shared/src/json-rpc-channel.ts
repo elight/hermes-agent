@@ -176,6 +176,18 @@ export interface JsonRpcRequestChannelOptions {
     onResult: (result: HelloHandshakeResult) => void
     onUnsupported: () => void
   }
+  /**
+   * Ordering gate for ``open_requests`` (#C6): the pending call still resolves exactly as before —
+   * the caller, the replay barriers and ``whenApplicationUsable`` never wait on this — but the
+   * requests an answer re-delivers (``session.resume`` / ``session.events.since`` /
+   * ``client.hello``) are presented only once it settles. A reconnecting client uses it to get its
+   * `session.resume` for the sessions behind those requests onto the wire first, so a card the
+   * user answers has a runtime to land on instead of a stale/reaped one.
+   *
+   * Delivery is never lost: a rejection, or a gate that never settles, still delivers (bounding it
+   * is the owner's job). Absent, delivery stays synchronous and byte-identical to before.
+   */
+  beforeOpenRequests?: () => Promise<unknown> | void
 }
 
 /**
@@ -258,12 +270,13 @@ export class JsonRpcRequestChannel {
   private backendClarifyBatch = false
   private readonly requestHandlers: ServerRequestHandler[] = []
   private readonly options: Required<
-    Omit<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'helloHandshake'>
+    Omit<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'helloHandshake' | 'beforeOpenRequests'>
   > &
-    Pick<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'helloHandshake'>
+    Pick<JsonRpcRequestChannelOptions, 'onEvent' | 'onHeartbeatFailure' | 'onRequestHandlerError' | 'onUncorrelatedError' | 'onUnhandledRequest' | 'helloHandshake' | 'beforeOpenRequests'>
 
   constructor(options: JsonRpcRequestChannelOptions = {}) {
     this.options = {
+      beforeOpenRequests: options.beforeOpenRequests,
       createRequestId: options.createRequestId ?? ((nextId: number) => `${options.requestIdPrefix ?? 'r'}${nextId}`),
       desktopLocal: options.desktopLocal ?? (() => false),
       heartbeatDeadlineMs: options.heartbeatDeadlineMs ?? DEFAULT_HEARTBEAT_DEADLINE_MS,
@@ -489,6 +502,29 @@ export class JsonRpcRequestChannel {
     return false
   }
 
+  /**
+   * Present an answer's `open_requests` — behind the ordering gate when one is installed (#C6), and
+   * synchronously (byte-identical to before, no extra microtask hop) when it is not.
+   *
+   * `settleResponse` never waits on this: the pending call resolves on the frame, which is what
+   * `onFirstResponse` / the replay barriers / `whenApplicationUsable` are really gated on. Only the
+   * arrival of the re-delivered requests is ordered.
+   */
+  private releaseOpenRequests(result: unknown): void {
+    const gate = this.options.beforeOpenRequests
+
+    if (!gate) {
+      this.deliverOpenRequests(result)
+
+      return
+    }
+
+    void Promise.resolve()
+      .then(() => gate())
+      .catch(() => undefined)
+      .then(() => this.deliverOpenRequests(result))
+  }
+
   private deliverOpenRequests(result: unknown): void {
     const open = (result as { open_requests?: unknown } | null)?.open_requests
 
@@ -529,8 +565,9 @@ export class JsonRpcRequestChannel {
     // client requests still waiting on this session. They cannot ride
     // the event replay ring (they are not events), so they are re-
     // delivered here, before the caller sees the result, over the very
-    // socket that owns them.
-    this.deliverOpenRequests(frame.result)
+    // socket that owns them. `releaseOpenRequests` only orders that
+    // presentation (never the resolution) behind a configured gate.
+    this.releaseOpenRequests(frame.result)
     call.resolve(frame.result)
   }
 
