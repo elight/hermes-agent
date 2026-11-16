@@ -1,0 +1,11 @@
+name: kanban-duplicate-gate
+version: 1.0.0
+description: "Refuse a kanban_create whose title matches an open card and whose description is not materially different (>= 0.90 similarity after card ids, timestamps and numbers are stripped). Local policy for this board — not upstream behaviour."
+author: "Evan Light (elight)"
+license: MIT
+homepage: "https://github.com/elight/hermes-agent/tree/kanban/dup-gate-plugin/local-plugins/kanban-duplicate-gate"
+tags:
+  - kanban
+  - policy
+provides_hooks:
+  - pre_tool_call
