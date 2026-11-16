@@ -1,0 +1,70 @@
+diff --git a/hermes_cli/kanban_db.py b/hermes_cli/kanban_db.py
+index cd14dc277c..254ea234f0 100644
+--- a/hermes_cli/kanban_db.py
++++ b/hermes_cli/kanban_db.py
+@@ -1154,6 +1154,52 @@ def _normalize_task_skills(skills: Optional[Iterable[str]]) -> Optional[list[str
+     return cleaned
+ 
+ 
++class DuplicateCardError(ValueError):
++    """A new card has the same title as an open card and a body that is not materially different."""
++
++    def __init__(self, existing_id: str, title: str, similarity: float):
++        self.existing_id, self.similarity = existing_id, similarity
++        super().__init__(
++            f"duplicate card: {existing_id} is already open with the identical title {title!r} and a "
++            f"description that is not materially different (similarity {similarity:.2f} >= "
++            f"{DUPLICATE_BODY_SIMILARITY:.2f}). Comment on {existing_id} instead, or give this card a "
++            f"different title or a materially different description. Nothing was created."
++        )
++
++
++# Same title + body at least this similar (after stripping ids, timestamps and numbers) = duplicate.
++DUPLICATE_BODY_SIMILARITY = 0.90
++_DUP_OPEN_EXCLUDED = ("done", "archived")
++
++
++def _dup_normalize(text: Optional[str]) -> str:
++    t = (text or "").lower()
++    t = re.sub(r"\bt_[0-9a-f]{6,}\b", " ", t)  # card ids
++    t = re.sub(r"\d{4}-\d{2}-\d{2}[t ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?z?", " ", t)  # timestamps
++    t = re.sub(r"\d+(?:\.\d+)?(?:e[+-]?\d+)?", " ", t)  # numbers: counts, ports, values
++    return re.sub(r"\s+", " ", t).strip()
++
++
++def _find_duplicate_card(conn: sqlite3.Connection, title: str, body: Optional[str]) -> Optional[tuple]:
++    """Return ``(id, similarity)`` of an open card with the same title and a near-identical body."""
++    import difflib
++
++    rows = conn.execute(
++        "SELECT id, body FROM tasks WHERE lower(trim(title)) = lower(trim(?)) "
++        f"AND status NOT IN ({','.join('?' * len(_DUP_OPEN_EXCLUDED))}) ORDER BY created_at",
++        (title, *_DUP_OPEN_EXCLUDED),
++    ).fetchall()
++    if not rows:
++        return None
++    new = _dup_normalize(body)
++    for r in rows:
++        old = _dup_normalize(r["body"])
++        sim = 1.0 if new == old else difflib.SequenceMatcher(None, new, old, autojunk=False).ratio()
++        if sim >= DUPLICATE_BODY_SIMILARITY:
++            return r["id"], sim
++    return None
++
++
+ def create_task(
+     conn: sqlite3.Connection, *, title: str, body: Optional[str] = None,
+     assignee: Optional[str] = None, created_by: Optional[str] = None,
+@@ -1233,6 +1279,12 @@ def create_task(
+         if row:
+             return row["id"]
+ 
++    # Duplicate gate: an open card with this exact title is assumed to be the same work
++    # unless the new description is materially different.
++    dup = _find_duplicate_card(conn, title, body)
++    if dup:
++        raise DuplicateCardError(dup[0], title.strip(), dup[1])
++
+     now = int(time.time())
+ 
+     # Only persistent kinds inherit the board ``default_workdir``: a scratch
