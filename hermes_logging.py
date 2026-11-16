@@ -163,6 +163,73 @@ def _safe_stderr():  # type: ignore[return]
         return stream  # best-effort: no buffer / wrapping failed -> original stream
 
 
+# ---------------------------------------------------------------------------
+# Journal-bound stderr: one journal record per log record, at its real level
+# ---------------------------------------------------------------------------
+
+#: logging level -> syslog priority, journald's ``<N>`` prefix vocabulary.
+_JOURNAL_PRIORITY = ((logging.CRITICAL, 2), (logging.ERROR, 3), (logging.WARNING, 4),
+                     (logging.INFO, 6))
+
+
+def journal_priority(levelno: int) -> int:
+    """Return the syslog priority (0-7) for a logging level."""
+    for level, priority in _JOURNAL_PRIORITY:
+        if levelno >= level:
+            return priority
+    return 7  # debug
+
+
+def _single_line(text: str) -> str:
+    """Collapse *text* — message and traceback alike — onto one physical line."""
+    return " | ".join(part.strip() for part in text.splitlines() if part.strip())
+
+
+def stream_is_journal(stream) -> bool:
+    """Return True when *stream* is the stderr systemd journals for this unit.
+
+    systemd exports ``JOURNAL_STREAM`` (``<dev>:<ino>``) into a unit whose
+    stdout/stderr it captures, and comparing it with the stream's own device and
+    inode is the only reliable answer: stderr is a journal for a service, the
+    host's log driver in a container, and this process's terminal for a hand-run
+    gateway. A child that redirected its stderr inherits the variable, and the
+    device/inode compare refuses it.
+    """
+    marker = os.environ.get("JOURNAL_STREAM", "")
+    if not marker:
+        return False
+    try:
+        dev, ino = (int(part, 10) for part in marker.split(":", 1))
+        info = os.fstat(stream.fileno())
+    except (AttributeError, OSError, TypeError, ValueError):
+        return False
+    return (info.st_dev, info.st_ino) == (dev, ino)
+
+
+class JournalStreamHandler(logging.StreamHandler):
+    """stderr handler for a systemd journal: one record per log record, real level.
+
+    journald stores every newline a unit writes to stdout/stderr as its OWN
+    record, all at PRIORITY=6, and the log shipper maps PRIORITY to Loki's
+    ``level`` label — so one ``logger.exception`` arrives as ~40 ``info`` records
+    that lie about their level and spend 40 lines of the shipper's daily budget
+    (measured on the hermes-VM: enough to spend a whole day's budget by 02:39).
+    On a journal stream this flattens each record onto one line and leads it with
+    the ``<N>`` prefix journald reads as the priority. Every other stream keeps
+    ``StreamHandler`` behaviour: a terminal keeps its readable multi-line
+    traceback and a container's log driver pays no journal budget.
+
+    The record is shaped in ``format`` so stdlib's ``emit`` writes it unchanged —
+    one line, so one journal record — and keeps its error boundary.
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if stream_is_journal(self.stream):
+            return f"<{journal_priority(record.levelno)}>{_single_line(message)}"
+        return message
+
+
 class _RedactingStdio:
     """Text stream proxy that redacts each write: a detached gateway's stdout/stderr IS a
     persisted log (``logs/gateway-stdio.log``), and agent status lines (provider error echoes)
@@ -437,7 +504,7 @@ def setup_verbose_logging() -> None:
 
     if any(getattr(h, "_hermes_verbose", False) for h in root.handlers):
         return
-    handler = logging.StreamHandler(_safe_stderr())
+    handler = JournalStreamHandler(_safe_stderr())
     handler.setLevel(logging.DEBUG)
     handler.setFormatter(RedactingFormatter(_LOG_FORMAT_VERBOSE, datefmt="%H:%M:%S"))
     handler._hermes_verbose = True  # type: ignore[attr-defined]
