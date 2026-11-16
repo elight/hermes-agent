@@ -50,6 +50,8 @@ SSE_RETRY_DELAY_INITIAL = 2.0
 SSE_RETRY_DELAY_MAX = 60.0
 HEALTH_CHECK_INTERVAL = 30.0  # seconds between health checks
 HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before concern
+IDLE_ANNOUNCE_INITIAL_DELAY = 120.0  # first repeat of an idle announcement; doubles from here
+IDLE_ANNOUNCE_MAX_DELAY = 3600.0  # ...capped: at most one idle announcement an hour
 
 # Magic-byte prefixes checked before delegating to the shared audio/AV sniffer.
 _MAGIC_EXTENSIONS = ((b"\x89PNG", ".png"), (b"\xff\xd8", ".jpg"), (b"GIF8", ".gif"), (b"%PDF", ".pdf"))
@@ -330,22 +332,49 @@ class SignalAdapter(BasePlatformAdapter):
         self._sse_response = None
 
     async def _health_monitor(self) -> None:
-        """Monitor SSE connection health and force reconnect if stale."""
+        """Monitor SSE connection health and force reconnect if stale.
+
+        A healthy-but-quiet stream is Signal's STEADY STATE — nobody is talking —
+        so the announcement backs off instead of warning every cycle: the first
+        idle detection of an episode is a WARNING, later ones repeat at INFO with
+        a doubling, capped delay, and real traffic closes the episode (announced)
+        so the next one warns again. The old per-cycle WARNING wrote ~2,100
+        journal lines a day across the gateway's adapters and, interleaved with
+        multi-line tracebacks, spent the log shipper's whole daily budget by
+        02:39 (t_1ec1601f). The daemon is still probed every cycle: only the log
+        line backs off, never the health check.
+        """
+        announce_after = 0.0
+        announced = False
+        backoff = IDLE_ANNOUNCE_INITIAL_DELAY
         while self._running:
             await asyncio.sleep(HEALTH_CHECK_INTERVAL)
             if not self._running:
                 break
-            if (elapsed := time.time() - self._last_sse_activity) <= HEALTH_CHECK_STALE_THRESHOLD:
+            now = time.time()
+            elapsed = now - self._last_sse_activity
+            if elapsed <= HEALTH_CHECK_STALE_THRESHOLD:
+                if announced:  # traffic resumed: close the episode, so the next one warns again
+                    logger.info("Signal: SSE traffic resumed after %.0fs idle", elapsed)
+                    announced = False
+                    backoff = IDLE_ANNOUNCE_INITIAL_DELAY
                 continue
-            logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+            if not announced:
+                logger.warning("Signal: SSE idle for %.0fs, checking daemon health", elapsed)
+                announced = True
+                announce_after = now + backoff
+            elif now >= announce_after:
+                logger.info("Signal: SSE idle for %.0fs, checking daemon health (announcing every %.0fs)",
+                            elapsed, backoff)
+                announce_after = now + backoff
+                backoff = min(backoff * 2, IDLE_ANNOUNCE_MAX_DELAY)
             try:
                 resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
             except Exception as e:
                 logger.warning("Signal: health check error: %s, forcing reconnect", e)
                 self._force_reconnect()
                 continue
-            if resp.status_code == 200:  # daemon alive but SSE quiet — reset activity to avoid repeated warnings
-                self._last_sse_activity = time.time()
+            if resp.status_code == 200:  # daemon alive but SSE quiet — activity stays untouched
                 logger.debug("Signal: daemon healthy, SSE idle")
             else:
                 logger.warning("Signal: health check failed (%d), forcing reconnect", resp.status_code)

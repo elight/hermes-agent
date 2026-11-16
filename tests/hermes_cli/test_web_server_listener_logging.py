@@ -8,6 +8,8 @@ nothing binds.
 """
 
 import logging
+import os
+import sys
 
 import pytest
 
@@ -100,3 +102,37 @@ def test_listener_config_keeps_uvicorn_on_the_console_and_out_of_the_hermes_logs
     agent_log = (root / "logs" / "agent.log").read_text(encoding="utf-8-sig")
     assert "hermes-file-warning" in agent_log
     assert "uvicorn-console-warning" not in agent_log and "/access-line" not in agent_log
+
+
+def test_uvicorn_console_handler_journals_one_record_per_log(tmp_path, monkeypatch):
+    """The listener's console handlers are journal-aware.
+
+    ``hermes serve`` runs under systemd with its stdout/stderr in the journal, where
+    every newline becomes its OWN record at PRIORITY=6 — a uvicorn traceback would
+    cost one `info` record per line and lie about its level. On a journal-marked
+    stream the handler must emit one line, carrying the record's real priority.
+    """
+    root = tmp_path / "root"
+    hermes_logging.setup_logging(hermes_home=root, mode="gateway", force=True)
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(write_fd, False)
+    info = os.fstat(write_fd)
+    monkeypatch.setenv("JOURNAL_STREAM", f"{info.st_dev}:{info.st_ino}")
+    stream = os.fdopen(write_fd, "w", encoding="utf-8")
+    monkeypatch.setattr(sys, "stderr", stream)
+    for name in _UVICORN_LOGGERS:  # so the listener installs its console handler
+        logging.getLogger(name).handlers[:] = []
+    try:
+        _gateway_listener(monkeypatch)
+        record = logging.LogRecord(
+            "uvicorn.error", logging.ERROR, __file__, 1,
+            "listener failed\nTraceback (most recent call last):\n  RuntimeError: port busy", (), None)
+        logging.getLogger("uvicorn").handle(record)
+        written = os.read(read_fd, 8192).decode()
+    finally:
+        stream.close()
+        os.close(read_fd)
+
+    assert written.count("\n") == 1, written
+    assert written.startswith("<3>"), written
+    assert "listener failed" in written and "RuntimeError: port busy" in written

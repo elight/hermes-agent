@@ -959,6 +959,82 @@ class TestSafeStderr:
         assert fake.buffer.getvalue() == "Session — 日本\n".encode()
 
 
+class TestJournalStreamHandler:
+    """A systemd-journal stderr costs ONE record per log record, at its real level.
+
+    journald stores every newline a unit writes to stderr as its own record, all
+    at PRIORITY=6, and the log shipper maps PRIORITY to Loki's ``level`` label —
+    so an unflattened ``logger.exception`` arrives as ~40 ``info`` records that
+    lie about their level and spend 40 lines of the shipper's daily budget.
+    """
+
+    @staticmethod
+    def _journal_pipe(monkeypatch):
+        """A pipe announced as the journal stream, the way systemd announces it."""
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        info = os.fstat(write_fd)
+        monkeypatch.setenv("JOURNAL_STREAM", f"{info.st_dev}:{info.st_ino}")
+        return read_fd, os.fdopen(write_fd, "w", encoding="utf-8")
+
+    def test_exception_becomes_one_record_at_the_real_priority(self, monkeypatch):
+        read_fd, stream = self._journal_pipe(monkeypatch)
+        handler = hermes_logging.JournalStreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(levelname)s %(name)s: %(message)s"))
+        try:
+            raise RuntimeError("the llm tenant could not be started")
+        except RuntimeError:
+            record = logging.LogRecord(
+                name="agent.chat_completion_helpers", level=logging.ERROR, pathname=__file__,
+                lineno=1, msg="Streaming failed before delivery: %s", args=(sys.exception(),),
+                exc_info=sys.exc_info())
+        try:
+            handler.emit(record)
+            written = os.read(read_fd, 65536).decode()
+        finally:
+            stream.close()
+            os.close(read_fd)
+
+        # ONE physical line (a single terminator) — that is ONE journal record.
+        assert written.count("\n") == 1, written
+        # `<3>` is the record's real priority; the shipper maps it to Loki's level.
+        assert written.startswith("<3>"), written
+        assert "ERROR agent.chat_completion_helpers: Streaming failed before delivery" in written
+        # The traceback is serialized onto that one line, never dropped.
+        assert "Traceback (most recent call last):" in written
+        assert "RuntimeError: the llm tenant could not be started" in written
+
+    def test_priority_prefix_matches_the_level(self, monkeypatch):
+        read_fd, stream = self._journal_pipe(monkeypatch)
+        handler = hermes_logging.JournalStreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(levelname)s"))
+        try:
+            for levelno in (logging.WARNING, logging.INFO, logging.DEBUG):
+                handler.handle(logging.LogRecord("probe", levelno, "", 0, "x", (), None))
+            written = os.read(read_fd, 4096).decode().splitlines()
+        finally:
+            stream.close()
+            os.close(read_fd)
+        assert written == ["<4>WARNING", "<6>INFO", "<7>DEBUG"], written
+
+    def test_other_streams_keep_streamhandler_behaviour(self, monkeypatch):
+        """A terminal (or a container's log driver) gets no prefix and no flattening:
+        a readable multi-line traceback there costs no journal budget."""
+        monkeypatch.delenv("JOURNAL_STREAM", raising=False)
+        stream = io.StringIO()
+        handler = hermes_logging.JournalStreamHandler(stream)
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        handler.handle(logging.LogRecord("probe", logging.ERROR, "", 0, "line one\nline two", (), None))
+        assert stream.getvalue() == "line one\nline two\n", stream.getvalue()
+
+    def test_redirected_stream_is_refused(self, monkeypatch):
+        """The marker alone is not enough: it must name THIS stream's device/inode,
+        or a child that inherited the variable would prefix a redirected stderr."""
+        monkeypatch.setenv("JOURNAL_STREAM", "0:1")
+        assert hermes_logging.stream_is_journal(io.StringIO()) is False
+        assert hermes_logging.stream_is_journal(io.BytesIO()) is False
+
+
 
 class TestLineBufferPipedStdout:
     """A piped stdout is line-buffered so headless log streams track the

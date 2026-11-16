@@ -531,11 +531,15 @@ def _uvicorn_console_logging() -> None:
     ``uvicorn.Config``'s default ``log_config`` runs ``dictConfig``, which calls
     ``logging.shutdown()`` on every live handler: a multiplexed gateway's profile log routers are
     already installed when its listener is built, and a closed router stays closed. The listeners
-    pass ``log_config=None`` and get uvicorn's handlers here instead: ``uvicorn`` to stderr,
-    ``uvicorn.access`` to stdout, neither propagating into the Hermes log files.
+    The listeners pass ``log_config=None`` and get uvicorn's handlers here instead: ``uvicorn`` to
+    stderr, ``uvicorn.access`` to stdout, neither propagating into the Hermes log files. Both are
+    journal-aware: where systemd captures the stream it stores ONE record per log record, at the
+    record's real priority, instead of one ``info`` record per traceback line.
     """
     from uvicorn.config import LOGGING_CONFIG
     from uvicorn.logging import AccessFormatter, DefaultFormatter
+
+    from hermes_logging import JournalStreamHandler
 
     formats = LOGGING_CONFIG["formatters"]
     for name, stream, formatter in (
@@ -545,7 +549,7 @@ def _uvicorn_console_logging() -> None:
         logger = logging.getLogger(name)
         logger.propagate = False
         if not logger.handlers:  # a second listener in this process keeps the first one's
-            handler = logging.StreamHandler(stream)
+            handler = JournalStreamHandler(stream)
             handler.setFormatter(formatter)
             logger.addHandler(handler)
     # LOGGING_CONFIG's level for the parent; uvicorn.Config sets only the child loggers' levels.

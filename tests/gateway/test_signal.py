@@ -1,7 +1,9 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import logging
 import pytest
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
@@ -1383,3 +1385,132 @@ class TestRecentSentTimestampRing:
         adapter._track_sent_timestamp({"timestamp": 3})
         # Both 1 and 2 should be evicted on TTL, only 3 remains
         assert list(adapter._recent_sent_timestamps.keys()) == [3]
+
+
+# ---------------------------------------------------------------------------
+# Health monitor: idle SSE announces once, then backs off
+# ---------------------------------------------------------------------------
+# A healthy-but-quiet SSE stream is the STEADY STATE of a Signal bot (nobody is
+# sending messages). The monitor must announce the first idle detection at
+# WARNING, then repeat QUIETLY (doubling, capped) instead of logging a WARNING
+# every 120 s forever: on the hermes-VM that chronic loop wrote ~2,100 journal
+# lines a day across three adapters and, interleaved with multi-line tracebacks,
+# spent the log shipper's entire 20,000-line daily budget by 02:39.
+
+
+class _FakeClock:
+    """Deterministic stand-in for ``time.time``."""
+
+    def __init__(self, start=1_000_000.0):
+        self.now = start
+
+    def time(self):
+        return self.now
+
+
+def _freeze_clock(monkeypatch):
+    """Freeze ``time.time`` and let ``asyncio.sleep`` advance it with no wall time.
+
+    Returns ``(clock, real_sleep)``: drive the monitor through *real_sleep* so one
+    yield advances exactly one ``HEALTH_CHECK_INTERVAL``.
+    """
+    import plugins.platforms.signal.adapter as sig_mod
+
+    clock = _FakeClock()
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        clock.now += seconds
+        await real_sleep(0)  # yield to the loop without consuming wall time
+
+    monkeypatch.setattr(sig_mod.time, "time", clock.time)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    return clock, real_sleep
+
+
+def _start_monitor(adapter):
+    return asyncio.create_task(adapter._health_monitor())
+
+
+async def _stop_monitor(task):
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+
+
+def _idle_records(caplog):
+    """The idle ANNOUNCEMENTS (both levels share this phrasing; the per-probe
+    ``daemon healthy, SSE idle`` debug line is not an announcement)."""
+    return [r for r in caplog.records if "SSE idle for" in r.getMessage()]
+
+
+def _idle_warnings(caplog):
+    return [r for r in _idle_records(caplog) if r.levelno == logging.WARNING]
+
+
+def _quiet_adapter(monkeypatch, clock):
+    """A running adapter whose daemon health probe always answers 200."""
+    adapter = _make_signal_adapter(monkeypatch)
+    adapter.client = AsyncMock()
+    adapter.client.get = AsyncMock(return_value=MagicMock(status_code=200))
+    adapter._running = True
+    adapter._last_sse_activity = clock.now
+    return adapter
+
+
+class TestSignalHealthMonitorIdleBackoff:
+    """Idle-but-healthy SSE: announce once per episode, then back off."""
+
+    @pytest.mark.asyncio
+    async def test_first_idle_notice_is_warning_then_backs_off(self, monkeypatch, caplog):
+        caplog.set_level(logging.DEBUG)
+        clock, real_sleep = _freeze_clock(monkeypatch)
+        adapter = _quiet_adapter(monkeypatch, clock)
+
+        task = _start_monitor(adapter)
+        for _ in range(720):  # 6 h of silence, one tick per 30 s health-check cycle
+            await real_sleep(0)
+        await _stop_monitor(task)
+
+        idle = _idle_records(caplog)
+        assert idle, "expected at least one idle announcement"
+        # The first announcement of an idle episode is a WARNING...
+        assert idle[0].levelno == logging.WARNING, idle[0]
+        # ...and every later one in the same episode is strictly quieter.
+        assert all(r.levelno < logging.WARNING for r in idle[1:]), [r.getMessage() for r in idle]
+        # Six hours of silence: a handful of announcements, not one per 120 s (180).
+        assert len(idle) <= 12, len(idle)
+        # Backing the announcement off must never back the health check off: a dead
+        # daemon has to be noticed on the next cycle, not up to an hour later.
+        assert adapter.client.get.await_count > len(idle), adapter.client.get.await_count
+
+    @pytest.mark.asyncio
+    async def test_traffic_closes_the_episode_and_re_arms_the_warning(self, monkeypatch, caplog):
+        caplog.set_level(logging.DEBUG)
+        clock, real_sleep = _freeze_clock(monkeypatch)
+        adapter = _quiet_adapter(monkeypatch, clock)
+
+        task = _start_monitor(adapter)
+        for _ in range(240):  # 2 h of silence: warned once, then backed off to INFO
+            await real_sleep(0)
+        assert len(_idle_warnings(caplog)) == 1, [r.getMessage() for r in _idle_records(caplog)]
+
+        keepalive_at = clock.now
+        await adapter._handle_sse_line(":")  # a keepalive: the stream is alive
+        for _ in range(2):  # the monitor sees the activity and closes the episode
+            await real_sleep(0)
+        resumed = [r for r in caplog.records if "traffic resumed" in r.getMessage()]
+        assert resumed, [r.getMessage() for r in caplog.records]
+        assert resumed[0].levelno == logging.INFO, resumed[0]
+
+        for _ in range(240):  # quiet again: a NEW episode must warn again
+            await real_sleep(0)
+        await _stop_monitor(task)
+
+        # Real traffic reset the backoff — a fix that backed off forever would leave
+        # the second episode silent at WARNING.
+        assert any(r.created > keepalive_at for r in _idle_warnings(caplog)), \
+            [r.getMessage() for r in _idle_records(caplog)]
+        # ...without the old per-120 s WARNING spam: one warning per episode is the
+        # contract (2 here; 60 under the old loop).
+        assert len(_idle_warnings(caplog)) <= 4, len(_idle_warnings(caplog))
