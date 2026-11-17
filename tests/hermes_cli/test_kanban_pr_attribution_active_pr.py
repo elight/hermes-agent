@@ -104,6 +104,36 @@ def _publish_pr(conn, task_id: str, url: str, *, profile: str = "dev", age_secon
     assert url in json.loads(stored).values(), stored
 
 
+def _record_url_on_closing_run(conn, task_id: str, key: str, url: str, *, ended_at: int,
+                               profile: str = "reviewer") -> None:
+    """Land a closing run on ``task_id`` whose metadata files ``url`` under ``key`` at ``ended_at``.
+
+    NOT the same thing as publishing the PR. A QA, review, follow-up or ship card files the
+    PR it worked on as a matter of course (measured: ``elight/catsdb/pull/14`` is recorded on
+    two cards; ``elight/llmbox/pull/38`` on the card that opened it AND on an ADR-renumber
+    card that worked on it afterwards). So a record answers "who handled this PR", and the
+    only ordering the guard can read out of it is ``ended_at`` — metadata lands when the run
+    closes, which is the instant the card started vouching for the URL.
+    """
+    with kb.write_txn(conn):
+        conn.execute(
+            "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at,"
+            " summary, metadata) VALUES (?, ?, 'completed', 'completed', ?, ?, ?, ?)",
+            (task_id, profile, ended_at - 60, ended_at, f"worked on {url}", json.dumps({key: url})),
+        )
+
+
+def _comment(conn, task_id: str, body: str, *, author: str = "dev") -> int:
+    """Add a comment and return its stored epoch, so sibling records can be timed against it."""
+    kb.add_comment(conn, task_id, author=author, body=body)
+    row = conn.execute(
+        "SELECT created_at FROM task_comments WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    stamp = kb._to_epoch(row["created_at"])
+    assert stamp is not None, f"fixture comment has no parseable stamp: {row['created_at']!r}"
+    return stamp
+
+
 def _guard(conn, task_id: str) -> str | None:
     return kbd.check_respawn_guard(conn, task_id)
 
@@ -233,9 +263,16 @@ def test_an_unattributed_pr_url_parks_the_card_whatever_its_spelling(kanban_home
         assert _guard(conn, fresh) == "active_pr"
 
 
-def test_contract_bound_pr_of_another_card_lifts_the_citation(kanban_home: Path) -> None:
-    """The other publication record counts too: the acceptance store binds an exact PR URL
-    into ``tasks.completion_contract`` when a declared contract meets the published PR."""
+def test_contract_binding_on_another_card_does_not_lift_the_hold(kanban_home: Path) -> None:
+    """A sibling's ``completion_contract`` is a declaration, not a dated publication.
+
+    Round-1 review: the acceptance store may bind an exact PR URL into
+    ``tasks.completion_contract`` for ANY card that declares it — including a review or QA
+    card whose acceptance *is* someone else's PR — and the binding carries no timestamp the
+    guard can order against a comment. So it can identify this card's own PR, but it can
+    never prove a sibling published it first. Measured: 0 cards on all 13 local boards bind
+    a PR URL in a contract, so nothing real depended on the old lift.
+    """
     with kbc.connect() as conn:
         sibling = kb.create_task(conn, title="sibling bound its contract", assignee="dev")
         with kb.write_txn(conn):
@@ -243,8 +280,126 @@ def test_contract_bound_pr_of_another_card_lifts_the_citation(kanban_home: Path)
         gate = kb.create_task(conn, title="gate cites it", assignee="dev")
         kb.add_comment(conn, gate, author="dev", body=SIBLING_CITATION)
 
-        assert _guard(conn, gate) is None
+        assert _guard(conn, gate) == "active_pr"
         assert _guard(conn, sibling) is None  # the owner has no PR comment; nothing to hold
+
+
+def test_own_contract_anchors_even_though_a_sibling_recorded_first(kanban_home: Path) -> None:
+    """This card's own record wins over an earlier sibling's: it still holds the lane.
+
+    Otherwise a card that declared the PR as its contract could be de-protected by some other
+    card that filed the same URL earlier, which is the fail-open this round is about.
+    """
+    with kbc.connect() as conn:
+        earlier = kb.create_task(conn, title="recorded the URL long ago", assignee="reviewer")
+        _record_url_on_closing_run(conn, earlier, "pr_reviewed", PUBLISHED_PR,
+                                   ended_at=int(time.time()) - 86_400)
+        own = kb.create_task(conn, title="declared the PR as its contract", assignee="dev")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET completion_contract = ? WHERE id = ?", (PUBLISHED_PR, own))
+        kb.add_comment(conn, own, author="dev", body=f"Opened {PUBLISHED_PR} for review.")
+
+        assert _guard(conn, own) == "active_pr"
+
+
+# --------------------------------------------------------------------------- round 2: the opener keeps its protection
+#
+# Review round 1 found the fail-open in the round-1 rule: it treated ANY card whose run
+# metadata contains the URL as that PR's publisher, and filing a handled PR on your own run
+# is routine. The opener's protection — the #111910 case, a worker that reported its PR only
+# in comment prose — was the first casualty, because a downstream card that recorded the PR
+# afterwards lifted the hold on the very card that opened it.
+
+
+def test_a_later_mention_on_another_card_keeps_the_openers_hold(kanban_home: Path) -> None:
+    """The reviewer's repro, verbatim. The card that spoke first keeps its protection.
+
+    1. Card P comments "Opened .../pull/14" and has NO closing-run metadata (worker crashed
+       or reported only in prose) — the #111910 case the rule promises to protect.
+    2. Unrelated card Q later closes a run whose metadata is ``{"pr_under_test": .../pull/14}``.
+    3. P must still be held. If Q's record frees P, a second worker is spawned against the PR
+       P already opened and a duplicate implementation follows.
+    """
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opened the PR, said so only in prose", assignee="dev")
+        said_at = _comment(conn, opener, f"Opened {PUBLISHED_PR} for review.")
+
+        handler = kb.create_task(conn, title="later QA card that filed the PR it tested", assignee="qa")
+        _record_url_on_closing_run(conn, handler, "pr_under_test", PUBLISHED_PR, ended_at=said_at + 30)
+
+        assert _guard(conn, opener) == "active_pr"
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert opener not in [s[0] for s in res.spawned]
+        assert dict(res.respawn_guarded)[opener] == "active_pr"
+
+
+def test_sibling_record_ending_before_the_comment_lifts_the_citation(kanban_home: Path) -> None:
+    """The incident's own timing must keep working: the sibling published 3 s BEFORE the cite.
+
+    Measured on the real board — publisher run 146 on ``t_44f96ba3`` ended at 1794635684,
+    comment 44 on the stuck gate card ``t_d66742ba`` was written at 1794635687. A record that
+    predates the comment cannot have been written about the comment's card, so the citation is
+    coordination prose and the lane frees.
+    """
+    with kbc.connect() as conn:
+        gate = kb.create_task(conn, title="deploy + QA gate", assignee="dev")
+        said_at = _comment(conn, gate, SIBLING_CITATION)
+        sibling = kb.create_task(conn, title="C6 sibling implementation", assignee="dev")
+        _record_url_on_closing_run(conn, sibling, "pr", PUBLISHED_PR, ended_at=said_at - 3)
+
+        assert _guard(conn, gate) is None
+        assert gate in [s[0] for s in kbd.dispatch_once(conn, dry_run=True).spawned]
+
+
+def test_sibling_record_ending_in_the_same_second_keeps_the_hold(kanban_home: Path) -> None:
+    """Same-second tie: ordering is undecidable, so the guard holds — as it does for a
+    same-second handoff event in the step that follows."""
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        said_at = _comment(conn, opener, f"Opened {PUBLISHED_PR} for review.")
+        handler = kb.create_task(conn, title="handler", assignee="qa")
+        _record_url_on_closing_run(conn, handler, "pr_under_test", PUBLISHED_PR, ended_at=said_at)
+
+        assert _guard(conn, opener) == "active_pr"
+
+
+def test_sibling_record_from_a_run_still_open_keeps_the_hold(kanban_home: Path) -> None:
+    """An open run has no ``ended_at``: nothing vouched for that URL yet, so no lift.
+
+    Real boards do have such rows (1 on ``hermes-agent``, 2 on ``island-of-misfit-cards``).
+    """
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        _comment(conn, opener, f"Opened {PUBLISHED_PR} for review.")
+        running = kb.create_task(conn, title="still running", assignee="qa")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at,"
+                " summary, metadata) VALUES (?, ?, 'running', NULL, ?, NULL, ?, ?)",
+                (running, "qa", int(time.time()) - 60, "working", json.dumps({"pr": PUBLISHED_PR})),
+            )
+
+        assert _guard(conn, opener) == "active_pr"
+
+
+def test_unreadable_comment_timestamp_keeps_the_hold(kanban_home: Path) -> None:
+    """A comment whose own stamp cannot be parsed cannot be out-ordered, so nothing lifts.
+
+    ``_rows_since`` substitutes ``now`` for an unreadable comment stamp on purpose, so that
+    the comment still *anchors*; that substituted value must not double as a real timestamp
+    for the attribution lookup, or garbage in ``created_at`` would become a way to lift the
+    hold on any card that has a PR in flight.
+    """
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        _comment(conn, opener, f"Opened {PUBLISHED_PR} for review.")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET created_at = 'later' WHERE task_id = ?", (opener,))
+        handler = kb.create_task(conn, title="handler", assignee="qa")
+        _record_url_on_closing_run(conn, handler, "pr_under_test", PUBLISHED_PR,
+                                   ended_at=int(time.time()) - 600)
+
+        assert _guard(conn, opener) == "active_pr"
 
 
 def test_review_lane_is_unaffected_by_the_attribution_rule(kanban_home: Path) -> None:

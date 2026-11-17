@@ -1635,14 +1635,19 @@ def check_respawn_guard(
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR —
     #    attributed to THIS card, not merely cited from a sibling's PR; unknown
-    #    authorship still counts (#111910). Exception: a handoff AFTER the newest
-    #    PR comment (operator reassign, reviewer changes_requested, review reopen)
+    #    authorship still counts (#111910). A sibling's own record lifts the hold only
+    #    when it was filed (run closed) BEFORE this comment: cards that handled the PR
+    #    afterwards say nothing about who spoke first, and must not de-protect the card
+    #    that opened it. An unparsable comment stamp is passed as unknown, so it anchors
+    #    (as above) but cannot be out-ordered into a lift. Exception: a handoff AFTER the
+    #    newest PR comment (operator reassign, reviewer changes_requested, review reopen)
     #    names the profile that must now work on THAT PR — a closer or the
     #    implementer finishing it, not a duplicate implementation. A crash/reclaim
     #    is not a handoff, so the worker that opened the PR is still not re-spawned.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _kpa.comment_anchors_active_pr(conn, task_id, _kb._lossy_text(c["body"]) or "")]
+                if _kpa.comment_anchors_active_pr(conn, task_id, _kb._lossy_text(c["body"]) or "",
+                                                  comment_epoch=_kb._to_epoch(c["created_at"]))]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(

@@ -48,54 +48,85 @@ def _pr_keys(text: str | None) -> set[str]:
             for match in _PR_MENTION.finditer(text or "")}
 
 
-def _pr_publication_owners(conn, pr_key: str) -> set[str]:
-    """Task ids whose own record publishes ``pr_key`` — the cards that opened it.
+def _pr_records(conn, pr_key: str, comment_epoch: int | None) -> list[tuple[str, bool]]:
+    """``(task_id, filed_before_the_comment)`` for every card whose record names ``pr_key``.
 
-    Publication is written by the publishing card's own worker and never by a card
-    that merely cites the PR, which makes it the one local distinction between
-    "this card has a PR in flight" and "a comment pointed at someone else's". Two
-    places record it: ``kanban_db`` lands a worker's metadata dict on its closing run
-    (workers name the URL under free-form keys — measured in production boards:
-    ``pr``, ``pr_head``, ``published_pr``), and :mod:`hermes_cli.kanban_pr_acceptance_store`
-    binds an exact PR URL into ``tasks.completion_contract``. The URL *value* is
-    therefore what identifies a publication, not a key name: a reader that looked
-    only for ``published_pr`` saw nothing on a board whose workers wrote ``pr``.
+    Recording a URL is NOT publishing it. QA, review, follow-up and ship cards file the PR they
+    handled on their own closing runs as a matter of course — measured on live boards: one PR
+    recorded on two cards on ``catsdb``, and on both the card that opened it and a follow-up
+    ADR-renumber card on ``island-of-misfit-cards``. So a record answers "which card handled
+    this PR", and the one ordering fact the guard can read out of it is *when* it was filed —
+    metadata lands when the run closes, so a record that predates the comment cannot have been
+    written in reaction to that comment, and a record filed after it says nothing about who
+    spoke first. That ordering is what separates a sibling's publication from a downstream
+    card handling this card's PR, and without it the citation rule de-protects the very card
+    that opened the PR (the #111910 case it exists to protect).
 
-    The SQL ``LIKE`` narrows candidates to rows carrying that ``owner/repo/pull/N``
-    (SQLite's LIKE is case-insensitive for ASCII); Python then compares whole keys,
-    so ``pull/140`` never vouches for ``pull/14``. An empty set means no card is
-    recorded as publishing it — unknown authorship, not evidence of absence.
+    Two places record the URL: ``kanban_db`` lands a worker's metadata dict on its closing run
+    and workers name the URL under free-form keys (measured: ``pr``, ``pr_head``,
+    ``pr_under_test``), so the URL *value* is what identifies a record, never a key name — a
+    reader looking only for ``published_pr`` saw nothing on a board whose workers wrote ``pr``
+    (open PR #145849 has exactly that gap). And :mod:`hermes_cli.kanban_pr_acceptance_store`
+    binds an exact PR URL into ``tasks.completion_contract``; a contract is a declaration any
+    card may make about anyone's PR and carries no write timestamp, so it is returned as
+    *never earlier* — it can prove this card's own PR, never a sibling's precedence.
+
+    Timing: ``ended_at`` is compared as stored. A row with no ``ended_at`` (a run still open) or
+    a non-integer stamp (text stamps exist, written outside the mutators, #97455) is not
+    orderable against a comment, so it is reported as not-earlier. Fail closed, everywhere.
+
+    Cost note: the leading-wildcard ``LIKE`` scans ``task_runs`` once per PR URL per guarded
+    comment per tick. That is fine at today's sizes (largest local board ~1.9k runs) and the
+    fix would be a normalised PR-URL column with an index, not a narrower matcher — narrowing
+    detection is what silently widens a fail-closed rule.
+
+    The SQL ``LIKE`` narrows candidates to rows carrying that ``owner/repo/pull/N`` (SQLite's
+    LIKE is case-insensitive for ASCII); Python then compares whole keys, so ``pull/140`` never
+    vouches for ``pull/14``. An empty result means no card is recorded as handling it — unknown
+    authorship, not evidence of absence.
     """
     repo, _, number = pr_key.rpartition("/pull/")
     needle = f"%{repo}/pull/{number}%"
-    owners: set[str] = set()
-    for row in conn.execute("SELECT id AS task_id, completion_contract AS record FROM tasks"
-                            " WHERE completion_contract LIKE ?", (needle,)):
+    records: list[tuple[str, bool]] = []
+    for row in conn.execute("SELECT id AS task_id, NULL AS ended_at, completion_contract AS record"
+                            " FROM tasks WHERE completion_contract LIKE ?", (needle,)):
         if pr_key in _pr_keys(row["record"]):
-            owners.add(row["task_id"])
-    for row in conn.execute("SELECT task_id, metadata AS record FROM task_runs WHERE metadata LIKE ?",
-                            (needle,)):
+            records.append((row["task_id"], False))
+    for row in conn.execute("SELECT task_id, ended_at, metadata AS record FROM task_runs"
+                            " WHERE metadata LIKE ?", (needle,)):
+        stamp = row["ended_at"]
+        earlier = (isinstance(stamp, (int, float)) and comment_epoch is not None
+                   and stamp < comment_epoch)
         if pr_key in _pr_keys(row["record"]):
-            owners.add(row["task_id"])
-    return owners
+            records.append((row["task_id"], earlier))
+    return records
 
 
-def comment_anchors_active_pr(conn, task_id: str, body: str) -> bool:
+def comment_anchors_active_pr(conn, task_id: str, body: str, *,
+                              comment_epoch: int | None = None) -> bool:
     """Whether ``body`` (a comment on ``task_id``) evidences a PR *this* card has open.
 
-    False only when every PR URL in the comment is recorded as some *other* card's
-    publication: such a comment is coordination prose about a sibling's PR — the
-    shape of a QA or hand-off note on a card whose job is to cite other cards — and
-    holding its lane for 24 h strands a chain that has nothing waiting on a review.
+    False only when EVERY PR URL in the comment is recorded as some *other* card's PR before
+    ``comment_epoch``: such a comment is coordination prose about a sibling's PR — the shape of
+    a QA or hand-off note on a card whose job is to cite other cards — and holding its lane for
+    24 h strands a chain that has nothing waiting on a review.
 
-    True otherwise, including the unknown case: a worker that reported its PR only
-    in comment prose stays protected from a duplicate implementation (#111910). A
-    comment citing several PRs anchors if any one of them is this card's or
-    unattributed, so this rule can only narrow the guard, never widen it.
+    True otherwise, which is every ambiguous case: this card's own record names the URL (it
+    published it, whatever else did); no card is recorded at all (a worker that reported its PR
+    only in comment prose stays protected from a duplicate implementation, #111910); or the only
+    other records were filed at/after the comment, which cannot show who spoke first. A comment
+    citing several PRs anchors if any one of them is own-or-unattributed, so the rule only
+    narrows the guard, never widens it.
+
+    ``comment_epoch`` is the comment's own parsed ``created_at``, and ``None`` means "unknown" —
+    an unparsable stamp must not be treated as "written just now", because that would let
+    garbage in ``created_at`` out-order every record and lift the hold on any open PR.
     """
     for pr_key in _pr_keys(body):
-        owners = _pr_publication_owners(conn, pr_key)
-        if not owners or task_id in owners:
+        records = _pr_records(conn, pr_key, comment_epoch)
+        if any(owner == task_id for owner, _ in records):
+            return True
+        if not any(owner != task_id and earlier for owner, earlier in records):
             return True
     return False
 
