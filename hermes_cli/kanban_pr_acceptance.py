@@ -19,6 +19,13 @@ from urllib.parse import quote
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)")
 
+# A PR URL mentioned anywhere in prose — a comment body, a run's metadata blob. Deliberately
+# as broad as the respawn-guard detector it feeds (``http`` allowed, host any case): a
+# narrower matcher would let a differently-spelled URL skip the guard altogether, which is
+# a silent widening of a fail-closed rule. The number is normalised, so ``pull/007`` and
+# ``pull/7`` key alike.
+_PR_MENTION = re.compile(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/([0-9]+)", re.IGNORECASE)
+
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
@@ -26,6 +33,71 @@ def validate_contract(value: str | None) -> str:
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):
         raise ValueError("completion_contract must be local-only, OWNER/REPO, or an exact GitHub PR URL")
     return value
+
+
+def _pr_keys(text: str | None) -> set[str]:
+    """Canonical ``owner/repo/pull/N`` keys for every GitHub PR URL in ``text``.
+
+    Its own detector rather than :data:`_PR`, because this one reads *prose*: it must
+    stay as broad as the guard regex it replaces — ``http``, any host case — or a
+    differently-spelled URL would quietly stop anchoring the guard at all. Keys are
+    canonicalised (lower-case, scheme and host dropped) so the same PR compares
+    equal on both sides of the attribution lookup.
+    """
+    return {f"{match[1]}/{match[2]}/pull/{int(match[3])}".lower()
+            for match in _PR_MENTION.finditer(text or "")}
+
+
+def _pr_publication_owners(conn, pr_key: str) -> set[str]:
+    """Task ids whose own record publishes ``pr_key`` — the cards that opened it.
+
+    Publication is written by the publishing card's own worker and never by a card
+    that merely cites the PR, which makes it the one local distinction between
+    "this card has a PR in flight" and "a comment pointed at someone else's". Two
+    places record it: ``kanban_db`` lands a worker's metadata dict on its closing run
+    (workers name the URL under free-form keys — measured in production boards:
+    ``pr``, ``pr_head``, ``published_pr``), and :mod:`hermes_cli.kanban_pr_acceptance_store`
+    binds an exact PR URL into ``tasks.completion_contract``. The URL *value* is
+    therefore what identifies a publication, not a key name: a reader that looked
+    only for ``published_pr`` saw nothing on a board whose workers wrote ``pr``.
+
+    The SQL ``LIKE`` narrows candidates to rows carrying that ``owner/repo/pull/N``
+    (SQLite's LIKE is case-insensitive for ASCII); Python then compares whole keys,
+    so ``pull/140`` never vouches for ``pull/14``. An empty set means no card is
+    recorded as publishing it — unknown authorship, not evidence of absence.
+    """
+    repo, _, number = pr_key.rpartition("/pull/")
+    needle = f"%{repo}/pull/{number}%"
+    owners: set[str] = set()
+    for row in conn.execute("SELECT id AS task_id, completion_contract AS record FROM tasks"
+                            " WHERE completion_contract LIKE ?", (needle,)):
+        if pr_key in _pr_keys(row["record"]):
+            owners.add(row["task_id"])
+    for row in conn.execute("SELECT task_id, metadata AS record FROM task_runs WHERE metadata LIKE ?",
+                            (needle,)):
+        if pr_key in _pr_keys(row["record"]):
+            owners.add(row["task_id"])
+    return owners
+
+
+def comment_anchors_active_pr(conn, task_id: str, body: str) -> bool:
+    """Whether ``body`` (a comment on ``task_id``) evidences a PR *this* card has open.
+
+    False only when every PR URL in the comment is recorded as some *other* card's
+    publication: such a comment is coordination prose about a sibling's PR — the
+    shape of a QA or hand-off note on a card whose job is to cite other cards — and
+    holding its lane for 24 h strands a chain that has nothing waiting on a review.
+
+    True otherwise, including the unknown case: a worker that reported its PR only
+    in comment prose stays protected from a duplicate implementation (#111910). A
+    comment citing several PRs anchors if any one of them is this card's or
+    unattributed, so this rule can only narrow the guard, never widen it.
+    """
+    for pr_key in _pr_keys(body):
+        owners = _pr_publication_owners(conn, pr_key)
+        if not owners or task_id in owners:
+            return True
+    return False
 
 
 def _api(endpoint: str, *, query: str | None = None, paginate: bool = False,

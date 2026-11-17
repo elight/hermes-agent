@@ -80,11 +80,6 @@ DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS = 300  # 5 minutes
 # Within this window a GitHub PR URL in a comment blocks re-spawn.
 _RESPAWN_GUARD_PR_WINDOW = 86400  # 24 hours
 
-_RESPAWN_GUARD_PR_URL_RE = re.compile(
-    r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
-    re.IGNORECASE,
-)
-
 
 @dataclass
 class DispatchResult:
@@ -1638,15 +1633,16 @@ def check_respawn_guard(
             conn, "task_events", task_id, success, "AND kind IN ('status', 'promoted', 'unblocked', 'reclaimed')")):
         return "recent_success"
 
-    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    #    Exception: a handoff AFTER the newest PR comment (operator reassign,
-    #    reviewer changes_requested, review reopen) names the profile that must
-    #    now work on THAT PR — a closer or the implementer finishing it, not a
-    #    duplicate implementation (#111910). A crash/reclaim is not a handoff,
-    #    so the worker that opened the PR is still not re-spawned against it.
+    # 4. GitHub PR URL in a recent comment — prior worker already opened a PR —
+    #    attributed to THIS card, not merely cited from a sibling's PR; unknown
+    #    authorship still counts (#111910). Exception: a handoff AFTER the newest
+    #    PR comment (operator reassign, reviewer changes_requested, review reopen)
+    #    names the profile that must now work on THAT PR — a closer or the
+    #    implementer finishing it, not a duplicate implementation. A crash/reclaim
+    #    is not a handoff, so the worker that opened the PR is still not re-spawned.
     pr_times = [t for t, c in _rows_since(conn, "task_comments", task_id, now - _RESPAWN_GUARD_PR_WINDOW,
                                           cols=", body", unreadable=now)  # duplicate-PR risk: fail closed
-                if _RESPAWN_GUARD_PR_URL_RE.search(_kb._lossy_text(c["body"]) or "")]
+                if _kpa.comment_anchors_active_pr(conn, task_id, _kb._lossy_text(c["body"]) or "")]
     if pr_times:
         # Strictly after: a same-second tie stays guarded (fail closed).
         if any(_is_handoff_event(e["kind"], e["payload"]) for _, e in _rows_since(
@@ -2903,3 +2899,4 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
+from hermes_cli import kanban_pr_acceptance as _kpa  # PR attribution for the active_pr step
