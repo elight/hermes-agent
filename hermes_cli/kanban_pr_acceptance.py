@@ -26,6 +26,12 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 # ``pull/7`` key alike.
 _PR_MENTION = re.compile(r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/([0-9]+)", re.IGNORECASE)
 
+# A board task id named in prose — the shape ``create_task`` mints (``t_`` + hex). Deliberately
+# that narrow shape and nothing else: "from the sibling card" is not attribution, and a
+# free-English matcher deciding a fail-closed rule is the #117009 class of bug. Used only as
+# one side of a two-sided signal (the named card must itself record the URL).
+_TASK_ID = re.compile(r"\bt_[0-9a-f]{6,}\b")
+
 
 def validate_contract(value: str | None) -> str:
     if value is None or value == "local-only":
@@ -106,27 +112,38 @@ def comment_anchors_active_pr(conn, task_id: str, body: str, *,
                               comment_epoch: int | None = None) -> bool:
     """Whether ``body`` (a comment on ``task_id``) evidences a PR *this* card has open.
 
-    False only when EVERY PR URL in the comment is recorded as some *other* card's PR before
-    ``comment_epoch``: such a comment is coordination prose about a sibling's PR — the shape of
-    a QA or hand-off note on a card whose job is to cite other cards — and holding its lane for
-    24 h strands a chain that has nothing waiting on a review.
+    False only when EVERY PR URL in the comment is attributable to some *other* card, by either
+    of two signals: that card's own record was filed (run closed) BEFORE ``comment_epoch``, or
+    the comment names that card by its board id and that card's record names this exact URL.
+    Such a comment is coordination prose about a sibling's PR — the shape of a QA or hand-off
+    note on a card whose job is to cite other cards — and holding its lane for 24 h strands a
+    chain that has nothing waiting on a review.
+
+    Naming is the weaker signal and is only accepted two-sided: the id must be the board's own
+    task-id shape and the named card must itself record the URL. It exists because a record
+    lags reality — metadata lands when a run closes, which can be well after the PR was opened,
+    and the live incident had a second cite (comment 40 on the parked gate card) whose owner's
+    record postdated it. Residual, accepted: a worker that opened a PR, filed no metadata, and
+    happened to name another card that also recorded that PR is not protected by this signal.
 
     True otherwise, which is every ambiguous case: this card's own record names the URL (it
     published it, whatever else did); no card is recorded at all (a worker that reported its PR
     only in comment prose stays protected from a duplicate implementation, #111910); or the only
-    other records were filed at/after the comment, which cannot show who spoke first. A comment
-    citing several PRs anchors if any one of them is own-or-unattributed, so the rule only
-    narrows the guard, never widens it.
+    other records were filed at/after the comment and no card is named, which cannot show who
+    spoke first. A comment citing several PRs anchors if any one of them is own-or-unattributed,
+    so the rule only narrows the guard, never widens it.
 
     ``comment_epoch`` is the comment's own parsed ``created_at``, and ``None`` means "unknown" —
     an unparsable stamp must not be treated as "written just now", because that would let
     garbage in ``created_at`` out-order every record and lift the hold on any open PR.
     """
+    cited = set(_TASK_ID.findall(body or "")) - {task_id}
     for pr_key in _pr_keys(body):
         records = _pr_records(conn, pr_key, comment_epoch)
         if any(owner == task_id for owner, _ in records):
             return True
-        if not any(owner != task_id and earlier for owner, earlier in records):
+        if (not any(owner != task_id and earlier for owner, earlier in records)
+                and not cited & {owner for owner, _ in records}):
             return True
     return False
 

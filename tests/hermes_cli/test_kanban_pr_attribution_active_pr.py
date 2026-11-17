@@ -402,6 +402,74 @@ def test_unreadable_comment_timestamp_keeps_the_hold(kanban_home: Path) -> None:
         assert _guard(conn, opener) == "active_pr"
 
 
+def test_comment_naming_the_sibling_lifts_when_its_record_lags(kanban_home: Path) -> None:
+    """The incident's SECOND comment, which the ordering rule alone cannot free.
+
+    Measured on the live board: gate card ``t_d66742ba`` had two PR cites, and the guard scans
+    all of them, so fixing only the ``pull/14`` one still leaves the card parked. Comment 40
+    cites ``pull/13`` and names its owner explicitly ("from ``t_de06ee1e``"), but that card's
+    run closed AFTER the comment -- metadata lands when a run closes, which can be long after
+    the PR was opened. Naming is the only attribution evidence that comment carries, so it is
+    accepted, but only two-sided: the id must be a board task id AND that card must itself
+    record this exact PR.
+    """
+    with kbc.connect() as conn:
+        owner = kb.create_task(conn, title="C1 contract gate", assignee="dev")
+        gate = kb.create_task(conn, title="deploy + QA gate", assignee="dev")
+        # names the real id, as the live comment did ("from `t_de06ee1e`, PR ...")
+        said_at = _comment(conn, gate, f"Head-up for this card's deploy leg, from `{owner}`"
+                                       f" (the C1 contract gate). Contract implemented, PR {PUBLISHED_PR}.")
+        _record_url_on_closing_run(conn, owner, "pr", PUBLISHED_PR, ended_at=said_at + 600)
+
+        assert _guard(conn, gate) is None
+        assert gate in [s[0] for s in kbd.dispatch_once(conn, dry_run=True).spawned]
+
+
+def test_naming_a_card_that_did_not_record_the_pr_keeps_the_hold(kanban_home: Path) -> None:
+    """One-sided naming proves nothing: the named card must vouch for the URL itself."""
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        said_at = _comment(conn, opener, f"Opened {PUBLISHED_PR}; follow-up tracked in `t_deadbeef`.")
+        unrelated = kb.create_task(conn, title="named but records nothing", assignee="reviewer")
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, started_at, ended_at,"
+                " summary, metadata) VALUES (?, ?, 'completed', 'completed', ?, ?, ?, ?)",
+                (unrelated, "reviewer", said_at - 60, said_at + 60, "nothing about a PR",
+                 json.dumps({"review_outcome": "approved"})),
+            )
+
+        assert _guard(conn, opener) == "active_pr"
+
+
+def test_naming_your_own_card_does_not_lift_the_hold(kanban_home: Path) -> None:
+    """A worker quoting its own card id (the common shape in a hand-off note) must not be able
+    to talk itself out of its own protection."""
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        said_at = _comment(conn, opener, f"Opened {PUBLISHED_PR} for this card (`{{self}}`).")
+        handler = kb.create_task(conn, title="handler", assignee="qa")
+        _record_url_on_closing_run(conn, handler, "pr_under_test", PUBLISHED_PR, ended_at=said_at + 30)
+
+        with kb.write_txn(conn):
+            conn.execute("UPDATE task_comments SET body = REPLACE(body, ?, ?) WHERE task_id = ?",
+                         ("{self}", opener, opener))
+        assert _guard(conn, opener) == "active_pr"
+
+
+def test_prose_attribution_without_a_task_id_keeps_the_hold(kanban_home: Path) -> None:
+    """\"from the sibling card\" is not an id. Parsing free-form English to decide a
+    fail-closed rule is the matcher class that produced #117009, so only the board's own
+    task-id shape counts as a citation."""
+    with kbc.connect() as conn:
+        opener = kb.create_task(conn, title="opener", assignee="dev")
+        said_at = _comment(conn, opener, f"Opened {PUBLISHED_PR} — finding from the sibling card above.")
+        handler = kb.create_task(conn, title="handler", assignee="qa")
+        _record_url_on_closing_run(conn, handler, "pr_under_test", PUBLISHED_PR, ended_at=said_at + 30)
+
+        assert _guard(conn, opener) == "active_pr"
+
+
 def test_review_lane_is_unaffected_by_the_attribution_rule(kanban_home: Path) -> None:
     """The lane exemption is untouched: a PR comment is a review handoff's INPUT, whether
     the PR is this card's or a sibling's."""
