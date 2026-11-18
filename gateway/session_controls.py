@@ -67,7 +67,8 @@ def _log_refusal(profile, method, exc: AuthorityRefusal) -> None:
     field = getattr(exc, 'field', None)
     if exc.reason == 'session_busy' or not (field or getattr(exc, 'detail', None)):
         logger.debug(line, *args)
-    elif field == 'request_id' and exc.reason == 'admission_conflict':
+    elif (field == 'request_id' and exc.reason == 'admission_conflict') or exc.reason == 'runtime_coordination_required':
+        # Coordination refusals name their cause for the client; a resume retry loop stays out of errors.log.
         logger.info(line, *args)
     else:
         logger.warning(line, *args)

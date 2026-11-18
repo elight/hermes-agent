@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ async def prepare_compress(authority, live, payload, prepared):
         raise AuthorityRefusal('compression_checkpoint_required')
     model, runtime = authority.runner._resolve_session_agent_runtime(source=live.source, session_key=live.route)
     if runtime.get('api_mode') == 'codex_app_server':
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('codex_manages_context')
     store = authority_persistence(authority)
     history = [m.as_openai_message() for m in store.messages.read_conversation(snapshot['target'])]
     messages = [m for m in history if m.get('role') in {'user', 'assistant', 'tool'}]

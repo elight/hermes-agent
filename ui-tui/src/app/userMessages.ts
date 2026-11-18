@@ -5,6 +5,7 @@
 // resolved against the active locale at call time, never at import time.
 
 import type { ErrorSurface } from '@hermes/shared/gateway-events'
+import { coordinationRefusalMessage } from '@hermes/shared/json-rpc-channel'
 
 import { messages, t } from '../i18n/runtime.js'
 import type { Translations } from '../i18n/types.js'
@@ -171,6 +172,14 @@ export const describeRpcError = (err: unknown): string => {
     logReplacedWireText(code, text)
 
     return versionSkewMessage()
+  }
+
+  const coordination = coordinationRefusalMessage(err)
+
+  if (coordination) {
+    logReplacedWireText(code, text)
+
+    return coordination
   }
 
   for (const [matcher, render] of RPC_ERROR_ROWS) {

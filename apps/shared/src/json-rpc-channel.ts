@@ -79,6 +79,21 @@ export function jsonRpcErrorReason(error: unknown): unknown {
   return error instanceof JsonRpcGatewayError ? (error.data as { reason?: unknown } | undefined)?.reason : undefined
 }
 
+/** The plain-English sentence a `runtime_coordination_required` refusal carries in `data.detail`
+ *  (persistence/core/coordination_refusals.py), or null. One code covers several unrelated causes,
+ *  so the bare code tells the user nothing; the sentence says what failed and what to do. */
+export function coordinationRefusalMessage(error: unknown): string | null {
+  if (!(error instanceof JsonRpcGatewayError)) {
+    return null
+  }
+
+  const data = error.data as { detail?: unknown; reason?: unknown } | undefined
+
+  return data?.reason === 'runtime_coordination_required' && typeof data.detail === 'string' && data.detail.trim()
+    ? data.detail.trim()
+    : null
+}
+
 /** Refusals `session.steer` / `session.redirect` answer before the text reaches any agent
  *  (gateway/session_busy_controls.py::correct): the turn the client believed busy is gone or cannot
  *  take a correction, so the words are safe to admit as the next prompt — never retried as a control. */

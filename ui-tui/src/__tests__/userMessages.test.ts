@@ -22,6 +22,28 @@ import { applyLocale, resetLocale } from '../i18n/runtime.js'
 // Behaviour contracts for the user-facing wording, not snapshots: each test
 // asserts the message names what happened and cites the real next step.
 
+describe('describeRpcError: runtime_coordination_required', () => {
+  it('prints the gateway sentence instead of the code', () => {
+    const detail = "Couldn't compress: the Codex runtime manages this chat's context itself."
+
+    const err = new JsonRpcGatewayError('runtime_coordination_required', {
+      code: 4001,
+      data: { reason: 'runtime_coordination_required', field: 'codex_manages_context', detail }
+    })
+
+    expect(describeRpcError(err)).toBe(detail)
+  })
+
+  it('an older gateway with no sentence still shows the code', () => {
+    const err = new JsonRpcGatewayError('runtime_coordination_required', {
+      code: 4001,
+      data: { reason: 'runtime_coordination_required' }
+    })
+
+    expect(describeRpcError(err)).toBe('runtime_coordination_required')
+  })
+})
+
 describe('describeTurnFailure', () => {
   it('turns an auth error_surface into a plain title, a Details line and the /model + /retry hint', () => {
     const raw =

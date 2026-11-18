@@ -8,6 +8,7 @@ import uuid
 
 from persistence.authority.bindings import local_session_id
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 from session_rules.route_entries import Platform, SessionEntry, SessionSource, _now, build_session_key
 
 from .._schema import TITLE_SOURCE_DERIVED, TITLE_SOURCE_USER
@@ -88,7 +89,7 @@ def _child_policy(policy, child, prepared):
         policy = {**policy, 'edit_approval_policy': 'ask'}
     if prepared is None:
         if policy.get('editor_mcp_json'):
-            raise AuthorityRefusal('runtime_coordination_required')
+            raise coordination_refusal('editor_tools_not_ready')
         return policy
     # Prepared against the parent's selection and the child id this commit derives; anything else moved.
     if child != prepared['child'] or policy.get('editor_mcp_json') != prepared['parent_editor_mcp_json']:
@@ -103,7 +104,7 @@ def branch_in_transaction(holder, conn, session_id, payload, prepared=None):
     row = conn.execute('SELECT value FROM state_meta WHERE key=?',
                        (POLICY_PREFIX + session_id,)).fetchone()
     if row is None:
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('no_local_settings')
     saved = json.loads(row[0])
     target = validate_local_lineage(conn, saved)
     require_idle(holder, conn, list({session_id, target}))
@@ -158,7 +159,7 @@ def reset_in_transaction(holder, conn, session_id, payload):
     saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                          (POLICY_PREFIX + session_id,)).fetchone()
     if saved is None:
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('no_local_settings')
     receipt = json.loads(saved[0])
     target = validate_local_lineage(conn, receipt)
     from ..workers._runtime_workers import discard_orphan_workers_on_reset, runtime_lineage

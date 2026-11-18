@@ -12,6 +12,7 @@ from functools import partial
 from gateway.session_messaging_picks import CHAT_PICKS, is_chat_pick
 from gateway.session_persistence import authority_persistence, owner_rule
 from persistence.core.errors import MUTATION_GUARD_REFUSALS, AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +184,11 @@ async def _mutate_session(authority, actor, ref, params, *, commit_lock=None, ow
                                 commit_lock=commit_lock)
 
 
+def _coordination_gate(cause):
+    refusal = coordination_refusal(cause)
+    return GateRefusal(refusal.reason, field=refusal.field, detail=refusal.detail)
+
+
 def _runtime_owns_authority(authority) -> bool:
     """Whether *authority* is one of its own runner's authorities, so one process coordinates
     both writes of a delete: the receipt commit to the authority's store and the routing retire
@@ -218,9 +224,9 @@ async def write_mutation(authority, ref, params, editor_servers, *, principal_id
             session_store = getattr(authority.runner, 'session_store', None)
             if session_store is not None and (session_store._routing_persistence is None
                     or not _runtime_owns_authority(authority)):
-                return GateRefusal('runtime_coordination_required')
+                return _coordination_gate('not_this_process')
         if operation in {'rewind', 'reset'} and not callable(getattr(authority.runner, '_evict_cached_agent', None)):
-            return GateRefusal('runtime_coordination_required')
+            return _coordination_gate('cannot_reset_running')
         return None
 
     fields = dict(principal_id=principal_id, session_id=ref.session_id,

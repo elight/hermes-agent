@@ -5,6 +5,7 @@ import json
 import time
 
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 from session_rules.legacy_local import binding_names, client_history_row, validate_legacy_row
 
 from ._runtime import _json
@@ -32,7 +33,7 @@ def bind_legacy_target(holder, conn, receipt, owner=None):
     root = _session_turn_lease_key_on_conn(holder, conn, target)
     if conn.execute('SELECT 1 FROM session_turn_leases WHERE conversation_id=? AND expires_at>?',
                     (root, time.time())).fetchone():
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('reply_in_progress')
     from ..conversation._store.local_migration import LEGACY_PREFIX
     key = LEGACY_PREFIX + target
     if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (key,)).fetchone():

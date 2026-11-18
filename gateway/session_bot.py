@@ -17,6 +17,7 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.session_persistence import authority_persistence, owner_rule
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 from tools.bot_failure_reasons import HELD_NOT_SENT, UNKNOWN
 from tools.bot_live_delivery import _TERMINAL, _delivery_id, _read
 logger = logging.getLogger(__name__)
@@ -717,7 +718,7 @@ async def _migrate(authority, actor, home, root):
         from hermes_cli.active_sessions import active_session_liveness_guard
         with active_session_liveness_guard(owner['session_id'], registry_home=home) as active:
             if active:
-                raise AuthorityRefusal('runtime_coordination_required')
+                raise coordination_refusal('bot_chat_open_elsewhere')
         if record['status'] == 'claimed':
             record.update(status='ambiguous', reason='unknown_execution')
             await write_receipt(home, record, expect='claimed')
@@ -945,8 +946,7 @@ async def _held_by_another_writer(home, key, exc):
     ``settle`` before it reports a no-send. Any other refusal keeps its unknown outcome."""
     if exc.reason != HELD_NOT_SENT or (await read_receipt(home, key))[1] is not None:
         return None
-    held = AuthorityRefusal(exc.reason, field='session_writer',
-                            detail='another session writer holds the Bot Chat; nothing was admitted yet')
+    held = coordination_refusal('bot_chat_open_elsewhere')
     held.admitted = False
     return held
 

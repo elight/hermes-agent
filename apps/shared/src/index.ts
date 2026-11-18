@@ -78,6 +78,7 @@ export {
   type TranslationOverride
 } from './i18n'
 export {
+  coordinationRefusalMessage,
   DEFAULT_HEARTBEAT_DEADLINE_MS,
   DEFAULT_HEARTBEAT_INTERVAL_MS,
   type GatewayRequestId,

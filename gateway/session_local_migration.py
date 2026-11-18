@@ -16,6 +16,7 @@ from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
 from gateway.session_persistence import authority_persistence, owner_rule
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 from persistence.conversation.sessions import parse_model_config
 
 
@@ -347,8 +348,8 @@ def adopt_legacy_session(authority, actor, row):
         # Same lock order as old Bot Chat: mailbox (if any), liveness, SQLite.
         with active_session_liveness_guard(sid, registry_home=store.scope.profile_dir) as active:
             if active:
-                raise AuthorityRefusal('runtime_coordination_required')
+                raise coordination_refusal('open_elsewhere')
             commit_local_session(store, epoch=authority.epoch, receipt=receipt, owner=rule)
     except ActiveSessionRegistryError as exc:
-        raise AuthorityRefusal('runtime_coordination_required') from exc
+        raise coordination_refusal('ownership_unknown') from exc
     return restore_local_session(authority, sid)

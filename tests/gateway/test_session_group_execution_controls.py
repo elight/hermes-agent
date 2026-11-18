@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.session_controls import AuthorityConnection
+from persistence.core.coordination_refusals import MESSAGES
 from persistence.core.errors import AuthorityRefusal
 from persistence_assembly import open_persistence, profile_scope, store_location
 from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
@@ -222,7 +223,10 @@ def test_send_refusals_say_only_a_refusal_before_commit_admitted_nothing(tmp_pat
 
             monkeypatch.setattr(service.runtime, 'status', lambda: {'running': True, 'stopping': True})
             undriven = await send('no-driver', 'Later')
-            assert undriven['error']['data'] == {'reason': 'runtime_coordination_required', 'admitted': False}
+            assert undriven['error']['data'] == {'reason': 'runtime_coordination_required', 'admitted': False,
+                                                 'field': 'group_send_not_running',
+                                                 'detail': MESSAGES['group_send_not_running']}
             stopped = await connection.dispatch({'id': 1, 'method': 'groups.stop', 'params': {'room_id': 'owned'}})
-            assert stopped['error']['data'] == {'reason': 'runtime_coordination_required'}
+            assert stopped['error']['data'] == {'reason': 'runtime_coordination_required', 'field': 'groups_not_running',
+                                                'detail': MESSAGES['groups_not_running']}
         asyncio.run(probe())

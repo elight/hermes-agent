@@ -52,6 +52,21 @@ test('ELEVENLABS_API_KEY not set toasts plain copy with an Open Keys action for 
   expect($routeRequest.get()?.path).toBe('/settings?tab=keys&key=ELEVENLABS_API_KEY')
 })
 
+test('runtime_coordination_required shows the gateway sentence, never the bare code', () => {
+  const detail = "Couldn't open this chat: it's open in another window or app. Close it there, then try again."
+
+  notifyError(
+    new JsonRpcGatewayError('runtime_coordination_required', {
+      code: 4001,
+      data: { reason: 'runtime_coordination_required', field: 'open_elsewhere', detail }
+    }),
+    'Resume failed'
+  )
+
+  expect(lastMessage()).toBe(detail)
+  expect(JSON.stringify($notifications.get()[0])).not.toContain('runtime_coordination_required')
+})
+
 test('structured storage_* error codes route to Maintenance', () => {
   notifyError(new Error('500 {"detail":{"message":"database is locked","code":"storage_locked"}}'), 'Prompt failed')
 

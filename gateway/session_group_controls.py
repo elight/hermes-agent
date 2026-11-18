@@ -8,6 +8,7 @@ import weakref
 
 from gateway.session_persistence import authority_persistence, owner_rule
 from persistence.core.errors import AuthorityRefusal, StoreUnavailable
+from persistence.core.coordination_refusals import coordination_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -105,10 +106,11 @@ async def dispatch_group_control(connection, method, params):
     return await asyncio.to_thread(invoke)
 
 
-def _refusal(reason, *, admitted=None):
+def _refusal(reason, *, admitted=None, cause=None):
     """The wire refusal; ``admitted=False`` (a groups.send refused before its user event
-    committed: ``HostedRoomService.send``, or no driver to take it) rides along as error data."""
-    refusal = AuthorityRefusal(reason)
+    committed: ``HostedRoomService.send``, or no driver to take it) rides along as error data.
+    A ``runtime_coordination_required`` *cause* adds its field and plain-English detail."""
+    refusal = coordination_refusal(cause) if cause else AuthorityRefusal(reason)
     if admitted is False:
         refusal.admitted = False
     return refusal
@@ -152,21 +154,21 @@ def _group(authority, actor, method, params, *, host_scope=False):
             room_authorizer(actor.subject, params['room_id'])
     if method in {'groups.attachment.upload', 'groups.attachment.download'}:
         if service is None:
-            raise AuthorityRefusal('runtime_coordination_required')
+            raise coordination_refusal('groups_not_running')
         from gateway.session_hosted_attachments import upload, download
         handler = upload if method == 'groups.attachment.upload' else download
         return handler(service, actor, params)
     if method in execution_methods:
         if service is None:
             if method == 'groups.send':
-                raise _refusal('runtime_coordination_required', admitted=False)
-            raise AuthorityRefusal('runtime_coordination_required')
+                raise _refusal('runtime_coordination_required', admitted=False, cause='group_send_not_running')
+            raise coordination_refusal('groups_not_running')
         if not params.get('room_id'):
             raise AuthorityRefusal('invalid_params')
         return _execution_control(service, method, params)
     if method == 'groups.peer.register':
         if service is None:
-            raise AuthorityRefusal('runtime_coordination_required')
+            raise coordination_refusal('groups_not_running')
         from gateway.session_group_peers import register
         return register(service, params)
 
@@ -275,7 +277,7 @@ def _disband(attached, service, store, gateway_id, params):
         state = rooms.room_state(store, placement='profile', room_id=room_id, include_disbanded=True)
         if (state.get('disbanded_at') is None and attached is None
                 and rooms.room_has_peer_obligations(store, placement='profile', room_id=room_id)):
-            raise AuthorityRefusal('runtime_coordination_required')
+            raise coordination_refusal('group_access_held')
         if service is not None and state.get('disbanded_at') is None:
             service.stop_room(room_id, cancel_id=params.get('cancel_id') or 'room-disbanded',
                               require_acknowledged=True)
@@ -284,7 +286,7 @@ def _disband(attached, service, store, gateway_id, params):
             # Metadata control must not destroy an active execution or bypass Stop.
             if service is None and any(list_tasks(store, placement='profile', room_id=room_id, status=status)
                    for status in ('queued', 'running', 'stopping', 'indeterminate', 'deferred')):
-                raise AuthorityRefusal('runtime_coordination_required')
+                raise coordination_refusal('group_still_working')
         for attempt in range(3):
             if state.get('disbanded_at') is None and attached is not None:
                 _revoke_routes_first(attached, room_id)
@@ -295,7 +297,7 @@ def _disband(attached, service, store, gateway_id, params):
                             expected_gateway_id=gateway_id, expected_epoch=state['authority_epoch'])}
             except RoomHeldGrantsPendingError:
                 if attached is None:
-                    raise AuthorityRefusal('runtime_coordination_required')
+                    raise coordination_refusal('group_access_held')
                 if attempt == 2:
                     raise
 

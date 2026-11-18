@@ -6,6 +6,7 @@ import json
 
 from persistence.authority.runtime import parse_mutation
 from persistence.core.errors import AuthorityRefusal
+from persistence.core.coordination_refusals import coordination_refusal
 
 from ._runtime import _epoch, _json, replay_mutation_receipt
 
@@ -18,7 +19,7 @@ def local_snapshot(holder, conn, session_id):
     from ._runtime_guards import require_target_advanceable
     row = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + session_id,)).fetchone()
     if row is None:
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('no_local_settings')
     saved = json.loads(row[0])
     target = validate_local_lineage(conn, saved)
     require_target_advanceable(holder, conn, list({session_id, target}))
@@ -28,7 +29,7 @@ def local_snapshot(holder, conn, session_id):
 
 def validate_prepared(holder, conn, session_id, prepared):
     if not isinstance(prepared, dict) or 'snapshot' not in prepared:
-        raise AuthorityRefusal('runtime_coordination_required')
+        raise coordination_refusal('not_prepared')
     current = local_snapshot(holder, conn, session_id)
     if current != prepared['snapshot']:
         raise AuthorityRefusal('revision_conflict')

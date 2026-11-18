@@ -1,3 +1,4 @@
+import { coordinationRefusalMessage } from '@hermes/shared'
 import { atom } from 'nanostores'
 
 import { translateNow } from '@/i18n'
@@ -310,6 +311,13 @@ export function readableError(
       },
       category: 'other'
     }
+  }
+
+  const coordination = coordinationRefusalMessage(error)
+
+  if (coordination) {
+    // One wire code, several causes: the gateway's sentence says which one and what to do.
+    return { message: coordination, category: 'other' }
   }
 
   const raw = error instanceof Error ? error.message : typeof error === 'string' ? error : fallback
