@@ -123,14 +123,15 @@ export function resolveDesktopRemoteRoute({
   if (envUrl) {
     const envToken = String(env.token || '').trim()
 
-    if (!envToken) {
-      throw new Error(
-        'HERMES_DESKTOP_REMOTE_URL is set but HERMES_DESKTOP_REMOTE_TOKEN is not. ' +
-          'Both must be provided to connect to a remote Hermes backend.'
-      )
-    }
-
-    return { authMode: 'token', kind: 'remote', source: 'env', token: envToken, url: envUrl }
+    // The documented override is URL-only ("you still sign in from the Gateway
+    // settings panel" — docs/reference/environment-variables.md,
+    // user-guide/desktop.md), so the URL alone selects the cookie/session leg:
+    // 'oauth'. HERMES_DESKTOP_REMOTE_TOKEN is the explicit opt-in that pins
+    // token mode (X-Hermes-Session-Token), which only a backend carrying the
+    // deployment session token accepts. An empty/blank token is an absent one.
+    return envToken
+      ? { authMode: 'token', kind: 'remote', source: 'env', token: envToken, url: envUrl }
+      : { authMode: 'oauth', kind: 'remote', source: 'env', url: envUrl }
   }
 
   if (config.mode === 'ssh') {
