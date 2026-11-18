@@ -51,16 +51,67 @@ test('environment route wins over global but never claims a registry id', () => 
   assert.equal(route?.kind === 'remote' ? route.url : null, 'https://env.test')
 })
 
-test('environment URL without its token keeps the existing error', () => {
-  assert.throws(
-    () =>
-      resolveDesktopRemoteRoute({
-        config: { mode: 'local' },
-        env: { url: 'https://env.test' },
-        registry: registry('local', [])
-      }),
-    /HERMES_DESKTOP_REMOTE_TOKEN is not/
-  )
+// The documented contract (website/docs/reference/environment-variables.md
+// `HERMES_DESKTOP_REMOTE_URL`, user-guide/desktop.md, features/web-dashboard.md):
+// the URL alone overrides the in-app gateway and the user STILL signs in from the
+// Gateway panel. Sign-in is the cookie/session leg, so a URL-only env override
+// resolves OAuth mode — it must not throw, and it must not claim token mode.
+test('environment URL alone resolves OAuth mode so the panel can sign in', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'local' },
+    env: { url: 'https://env.test' },
+    registry: registry('local', [])
+  })
+
+  assert.equal(route?.kind, 'remote')
+  assert.equal(route?.source, 'env')
+  assert.equal((route as any)?.authMode, 'oauth')
+  assert.equal((route as any)?.url, 'https://env.test')
+  assert.equal((route as any)?.token, undefined)
+  assert.equal(route?.connectionId, undefined)
+})
+
+// A set-but-empty variable (`ENV=""` in a launcher/compose file, or a blank
+// export) is an absent token, so the documented URL-only flow still applies.
+test('environment URL with a blank token still resolves OAuth mode', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'local' },
+    env: { token: '   ', url: 'https://env.test' },
+    registry: registry('local', [])
+  })
+
+  assert.equal(route?.source, 'env')
+  assert.equal((route as any)?.authMode, 'oauth')
+  assert.equal((route as any)?.token, undefined)
+})
+
+// The other documented branch: supplying HERMES_DESKTOP_REMOTE_TOKEN still pins
+// token mode, so existing launchers (the e2e remote topology, fleet scripts that
+// pass the deployment token) keep dialing with X-Hermes-Session-Token.
+test('environment URL with its token keeps token mode and its token', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'local' },
+    env: { token: 'env-token', url: 'https://env.test' },
+    registry: registry('local', [])
+  })
+
+  assert.equal(route?.kind, 'remote')
+  assert.equal(route?.source, 'env')
+  assert.equal((route as any)?.authMode, 'token')
+  assert.equal((route as any)?.token, 'env-token')
+  assert.equal((route as any)?.url, 'https://env.test')
+})
+
+// The URL is the switch. A token with no URL resolves nothing (unchanged: it has
+// never produced an env route), so a half-set pair cannot silently dial.
+test('environment token without a URL produces no env route', () => {
+  const route = resolveDesktopRemoteRoute({
+    config: { mode: 'local' },
+    env: { token: 'env-token' },
+    registry: registry('local', [])
+  })
+
+  assert.equal(route, null)
 })
 
 test('global remote uses exact primary provenance when another row is identical', () => {
