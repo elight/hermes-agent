@@ -2696,6 +2696,34 @@ class _BedrockStream:
         return _with_stream_emitters(self.agent, self._poll)
 
 
+def _log_stream_failure_before_delivery(agent: Any, e: Exception) -> None:
+    """Log a pre-delivery stream failure at a level that matches its fate.
+
+    A retryable capacity/overload refusal (e.g. a served-model
+    ``503 strata is at capacity ... retry the same model in N seconds``) is
+    routine backpressure: the outer retry loop owns recovery and already logs
+    the failed attempt and the retry. An ERROR plus a ~30-frame traceback on
+    every attempt floods the journal for an error we recover from by design,
+    so a retryable failure gets ONE WARNING line; non-retryable failures keep
+    the full traceback (t_68927ab4).
+    """
+    cls = None
+    with contextlib.suppress(Exception):
+        from agent.error_classifier import classify_api_error
+        cls = classify_api_error(
+            e,
+            provider=str(getattr(agent, "provider", "") or ""),
+            model=str(getattr(agent, "model", "") or ""),
+            base_url=str(getattr(agent, "base_url", "") or ""),
+        )
+    if cls is not None and cls.retryable:
+        logger.warning(
+            "Streaming failed before delivery (%s, retryable — outer retry loop owns recovery): %s",
+            cls.reason.value, e)
+    else:
+        logger.exception("Streaming failed before delivery: %s", e)
+
+
 class _StreamingCall(StreamingWaitMonitor):
     """One streaming request on the chat_completions / anthropic_messages wire.
     State shared between the request worker and the poll-loop monitor (heartbeat,
@@ -3632,7 +3660,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 buffer_connect_exhausted_notice(self.agent, e, attempts=max_retries + 1, base_url=self.agent.base_url)
         else:
             self._maybe_disable_streaming(e)
-            logger.exception("Streaming failed before delivery: %s", e)
+            _log_stream_failure_before_delivery(self.agent, e)
             if self._unmask_server_error_with_nonstreaming(e):
                 return False
         # Propagate to the main retry loop (credential rotation, fallback, backoff).
