@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
+from agent import provider_locks
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.route_verdicts import route_visit
 from agent.turn_overflow import recover_from_overflow
@@ -135,6 +136,11 @@ def handle_api_error(
         classified.retryable, classified.should_compress,
         classified.should_rotate_credential, classified.should_fallback,
     )
+    # A provider saying the ACCOUNT is spent closes that egress path for every process on this
+    # host, so no other session redials it (2026-11-20: one account's monthly spend limit, N
+    # private backoffs, one saturated event loop). A plain throttle keeps its per-request backoff.
+    provider_locks.maybe_lock_from_error(
+        classified, provider=getattr(agent, "provider", "") or "", component="agent-loop")
     # The provider's own words for the switch notice, should this error end in a fallback.
     summarize = getattr(agent, "_summarize_api_error", None)
     from agent.fallback_notice import record_fallback_trigger

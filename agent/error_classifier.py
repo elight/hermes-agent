@@ -40,6 +40,7 @@ class FailoverReason(enum.Enum):
     rate_limit = "rate_limit"            # 429 or quota-based throttling — backoff then rotate
     upstream_rate_limit = "upstream_rate_limit"  # Aggregator's upstream model 429 — fallback model, key is healthy
     upstream_blocked = "upstream_blocked"  # 403 from a WAF/CDN/proxy in front of the provider — key is healthy, fallback
+    provider_path_locked = "provider_path_locked"  # This egress path is locked until reopened — never retried, always the next fallback rung
     overloaded = "overloaded"            # 503/529 — provider overloaded, backoff
     server_error = "server_error"        # 500/502 — internal server error, retry
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
@@ -129,10 +130,12 @@ _BILLING_PATTERNS = (
     "hard billing limit",
 )
 
-# A named daily/weekly window: billing unless a reset signal says otherwise.
+# A named daily/weekly/monthly window: billing unless a reset signal says otherwise. A monthly
+# cap (the Claude subscription's spend limit) is the clearest case — nothing Hermes retries lifts it.
 _LONG_QUOTA_WINDOW_PATTERNS = (
     "tokens per day", "daily limit", "daily quota", "weekly usage limit", "weekly limit",
-    "reached your session usage limit",
+    "reached your session usage limit", "monthly usage limit", "monthly spend limit",
+    "monthly spending limit", "monthly quota", "monthly limit",
 )
 _QUOTA_WINDOW_PATTERNS = _LONG_QUOTA_WINDOW_PATTERNS + ("quota exceeded", "quota_exceeded", "upgrade for higher limits")
 # An account wall on a 403, 404, 429 or status-less body; bare "billing" is not one.
@@ -566,6 +569,9 @@ _V_AUTH_ROTATE = _v(_R.auth, retryable=False, **_ROTATE_FALLBACK)
 _V_AUTH_FALLBACK = _v(_R.auth, **_ABORT_FALLBACK)
 _V_MODEL_NOT_FOUND = _v(_R.model_not_found, **_ABORT_FALLBACK)
 _V_UPSTREAM_BLOCKED = _v(_R.upstream_blocked, **_ABORT_FALLBACK)
+# A locked egress path: never retried (that is the storm the lock exists to stop), always handed to
+# the next fallback rung, and no credential is at fault so the pool is never rotated.
+_V_PROVIDER_PATH_LOCKED = _v(_R.provider_path_locked, **_ABORT_FALLBACK)
 _V_CONTENT_BLOCKED = _v(_R.content_policy_blocked, **_ABORT_FALLBACK)
 _V_GUARDRAIL_BLOCKED = _v(_R.guardrail_blocked, **_ABORT_FALLBACK)
 # Another account in the same pool may hold the entitlement; the credential itself is healthy.
@@ -1124,13 +1130,45 @@ def _by_status(c: _Ctx) -> Optional[Verdict]:
     return _STATUS_HANDLERS[status](c) if status in _STATUS_HANDLERS else default
 
 
-# Stage order: plugin hooks → the provider's own profile hook → provider-specific special cases →
+def _provider_path_lock_verdict(c: _Ctx) -> Optional[Verdict]:
+    """A refusal made by this host, not by a provider: the egress path is locked until reopened.
+
+    ``agent.provider_locks.dial`` raises before the request is built, and this makes the existing
+    recovery machinery read that as provider unavailability: no retries, and the caller's fallback
+    chain takes the turn. A fallback model on the same locked path hits the same check, so the chain
+    walks on its own — there is no second routing path here."""
+    from agent.provider_locks import ProviderPathLocked
+    if not isinstance(c.error, ProviderPathLocked):
+        return None
+    lock = c.error.lock
+    return _v(_R.provider_path_locked, **_ABORT_FALLBACK,
+              error_context={"locked_path": lock.path, "lock_class": lock.lock_class})
+
+
+# Stage order: a locked egress path (a local fact, not a provider answer) → plugin hooks → the
+# provider's own profile hook → provider-specific special cases →
 # HTTP status → MoA shapes → structured error code → message patterns → SSL → disconnect +
 # large session → transport types → unknown (retryable with backoff).
 _STAGES: Sequence[Callable[[_Ctx], Optional[Verdict]]] = (
+    _provider_path_lock_verdict,
     _plugin_verdict, _profile_verdict, _provider_special_cases, _by_status, _moa_special_cases,
     _by_error_code, _by_message, _by_transport,
 )
+
+
+def _unwrap_relay_envelope(status: Optional[int], body: Any) -> tuple[Optional[int], Optional[int]]:
+    """Read a relay's 5xx envelope for the refusal it carried; return ``(to_classify, envelope)``.
+
+    claude-sub wraps its upstream's 429 inside an HTTP 502, so classifying the envelope turned a
+    hard monthly quota into a transient gateway error — and every session kept retrying one dead
+    account (2026-11-20, #91091/#80553). Only a nested 4xx behind a 5xx unwraps: a nested 5xx says
+    nothing about an account, and a 4xx envelope is already the refusal itself."""
+    if status is None or not 500 <= status < 600:
+        return status, None
+    nested = _status_code_from_body(body)
+    if nested is None or nested == status or not 400 <= nested < 500:
+        return status, None
+    return nested, status
 
 
 def classify_api_error(
@@ -1146,12 +1184,14 @@ def classify_api_error(
     ``api_key`` identifies an anonymous request; a host or fairshare reason alone does not.
     The credential is never included in the returned context."""
     from hermes_cli.anon_auth import is_anonymous_request
+    body = _extract_error_body(error)
     status_code = _extract_status_code(error)
     # Some SDK RateLimitError / AuthenticationError classes set no .status_code; the class names it.
     if status_code is None:
         name = type(error).__name__
         status_code = 429 if name == "RateLimitError" else 401 if "authenticationerror" in name.lower() else None
-    body = _extract_error_body(error)
+    # A relay's envelope is unwrapped BEFORE classifying, so a wrapped quota lands on ``billing``.
+    status_code, wrapped_status = _unwrap_relay_envelope(status_code, body)
     c = _Ctx(
         error, status_code, body, _build_error_msg(error, body), provider, model,
         approx_tokens, context_length, num_messages, str(base_url or ""),
@@ -1159,6 +1199,9 @@ def classify_api_error(
     )
     stage, verdict = next(((s, v) for s in _STAGES if (v := s(c)) is not None), (None, _V_UNKNOWN))
     extra = _shape_context(c, verdict, hooked=stage in (_plugin_verdict, _profile_verdict))
+    if wrapped_status is not None:
+        # Keep the envelope visible: "502 carrying a 429" is the fact an operator reads.
+        extra = {**extra, "wrapped_status": wrapped_status}
     if extra:
         verdict = {**verdict, "error_context": {**(verdict.get("error_context") or {}), **extra}}
     message = _extract_message(error, body)

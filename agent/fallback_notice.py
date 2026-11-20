@@ -29,6 +29,7 @@ _FALLBACK_REASON_LABELS = {
     FailoverReason.image_too_large: "image payload too large",
     FailoverReason.model_not_found: "model not found",
     FailoverReason.provider_policy_blocked: "provider policy blocked the request",
+    FailoverReason.provider_path_locked: "provider path locked out",
     FailoverReason.content_policy_blocked: "content policy blocked the request",
     FailoverReason.format_error: "request format rejected",
     FailoverReason.role_alternation: "adjacent same-role messages rejected",

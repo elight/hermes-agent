@@ -815,6 +815,7 @@ from hermes_cli.web_routers import (
     gateway_connections_reach as _gateway_connections_reach_routes,
     webapp_relay_proxy as _webapp_relay_proxy_routes,
     peer as _peer_routes,
+    provider_locks as _provider_locks_routes,
 )
 
 import hermes_cli.web_routers.desktop_plugins as _desktop_plugin_routes
@@ -848,6 +849,8 @@ app.include_router(_status_routes.logs_router)
 app.include_router(_cron_routes.router)
 app.include_router(_mcp_routes.router)
 app.include_router(_ops_routes.router)
+# Locked provider paths: what is closed, and the dashboard's reopen.
+app.include_router(_provider_locks_routes.router)
 app.include_router(_transfer_routes.router)
 app.include_router(_skills_routes.hub_router)
 app.include_router(_profiles_routes.router)
