@@ -2696,16 +2696,41 @@ class _BedrockStream:
         return _with_stream_emitters(self.agent, self._poll)
 
 
+# Verdicts that mean "the provider is full or throttling us, try again later" —
+# the served-model 503/529 capacity refusal (``overloaded``), a normal 429 quota
+# throttle (``rate_limit``), and an aggregator's upstream-model 429
+# (``upstream_rate_limit``). These are routine backpressure the outer retry loop
+# recovers from by design, so they log ONE line.
+#
+# This is an explicit allowlist keyed on the *reason*, NOT on ``cls.retryable``.
+# ``classify_api_error`` falls through to ``FailoverReason.unknown``, and ``unknown``
+# is retryable by default (error_classifier.py). That bucket is exactly where a bare
+# programming error in the stream/parse pipeline lands — ``KeyError('choices')``,
+# ``AttributeError`` on ``.delta``, a ``TypeError``. Demoting on ``retryable`` would
+# swallow those tracebacks (review r1, t_68927ab4). ``timeout`` and ``server_error``
+# are deliberately NOT listed: they are unexpected provider/transport faults, not a
+# back-off instruction, they are not the measured flood, and they are low-volume, so
+# keeping their traceback costs little and preserves signal for real infra failures.
+_QUIET_STREAM_BACKPRESSURE_REASONS = frozenset({
+    "overloaded", "rate_limit", "upstream_rate_limit",
+})
+
+
 def _log_stream_failure_before_delivery(agent: Any, e: Exception) -> None:
     """Log a pre-delivery stream failure at a level that matches its fate.
 
-    A retryable capacity/overload refusal (e.g. a served-model
-    ``503 strata is at capacity ... retry the same model in N seconds``) is
-    routine backpressure: the outer retry loop owns recovery and already logs
-    the failed attempt and the retry. An ERROR plus a ~30-frame traceback on
-    every attempt floods the journal for an error we recover from by design,
-    so a retryable failure gets ONE WARNING line; non-retryable failures keep
-    the full traceback (t_68927ab4).
+    A provider backpressure refusal (e.g. a served-model ``503 strata is at
+    capacity ... retry the same model in N seconds``, or a 429 throttle) is
+    routine: the outer retry loop owns recovery and already logs the failed
+    attempt and the retry. An ERROR plus a ~30-frame traceback on every attempt
+    floods the journal for an error we recover from by design, so those get ONE
+    WARNING line (t_68927ab4).
+
+    The decision keys on the *reason* against ``_QUIET_STREAM_BACKPRESSURE_REASONS``,
+    never on ``retryable``: the classifier's ``unknown`` fallthrough is retryable and
+    is where real bugs land, so every other verdict — ``unknown`` included — keeps
+    ``logger.exception`` and its traceback. If classification itself cannot run we
+    fail closed toward the traceback rather than under-log a real fault.
     """
     cls = None
     with contextlib.suppress(Exception):
@@ -2716,9 +2741,9 @@ def _log_stream_failure_before_delivery(agent: Any, e: Exception) -> None:
             model=str(getattr(agent, "model", "") or ""),
             base_url=str(getattr(agent, "base_url", "") or ""),
         )
-    if cls is not None and cls.retryable:
+    if cls is not None and cls.reason.value in _QUIET_STREAM_BACKPRESSURE_REASONS:
         logger.warning(
-            "Streaming failed before delivery (%s, retryable — outer retry loop owns recovery): %s",
+            "Streaming failed before delivery (%s: provider backpressure — outer retry loop owns recovery): %s",
             cls.reason.value, e)
     else:
         logger.exception("Streaming failed before delivery: %s", e)
