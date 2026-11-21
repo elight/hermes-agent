@@ -1315,6 +1315,17 @@ def ticker_heartbeat_writer_alive() -> bool:
         return False
 
 
+def get_ticker_heartbeat_writer_pid() -> Optional[int]:
+    """The pid recorded in this store's ticker heartbeat, or None (missing marker or legacy
+    bare-epoch stamp). ``ticker_heartbeat_writer_alive`` is the boolean answer; this names the
+    writer so a stall announce (gateway/run_cron_liveness.py) can say WHICH process last beat."""
+    fields = _read_marker_fields("ticker_heartbeat")
+    try:
+        return int(fields[1]) if len(fields) >= 2 else None
+    except (IndexError, ValueError):
+        return None
+
+
 def get_ticker_heartbeat_age() -> Optional[float]:
     """Seconds since the ticker loop last iterated; None = missing/unreadable ("cannot determine",
     not "dead").
