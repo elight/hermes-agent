@@ -108,17 +108,22 @@ def test_gated_status_is_public(gated_app):
 @pytest.mark.parametrize("path", [
     "/api/health",
     "/api/config/defaults",
-    "/api/config/schema",
     "/api/model/info",
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
 ])
 def test_other_public_api_paths_are_public_under_gate(gated_app, path):
-    """The remaining ``PUBLIC_API_PATHS`` entries must also bypass the
-    gate. They're documented as non-sensitive read-only endpoints that
-    the SPA pre-loads before login (themes, config schema, model
-    metadata). A 401 / 302-to-login here would block the dashboard
-    shell from rendering pre-auth.
+    """Every remaining entry in the shared ``PUBLIC_API_PATHS`` allowlist must
+    bypass the gate — this test pins the bypass, not the reason an entry is on
+    the list. That reason is a judgement about THAT route's payload and has to
+    be re-made whenever the payload changes: ``/api/config/schema`` sat here
+    from April 2026 while it returned a fixed constant and stayed after July
+    2026 when it began building per-profile data per request, so an anonymous
+    caller could read any profile's composition. Its replacement contract is
+    ``test_gated_config_schema_*`` / ``test_loopback_config_schema_*`` below;
+    the pre-login argument in the old docstring never held anyway, because
+    ``GET /`` and ``GET /config`` 302 to ``/login`` and the server-rendered
+    ``/login`` page fetches no ``/api/`` path.
 
     Accept any non-auth-failure status: 200 when the route succeeds,
     or any route-specific error (e.g. 400 / 404 / 500 from a missing
@@ -509,6 +514,111 @@ def test_api_auth_me_still_rejects_missing_token_in_loopback(loopback_app):
     must still 401 even in loopback mode."""
     r = loopback_app.get("/api/auth/me")
     assert r.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# GET /api/config/schema — gated on BOTH gates
+# ---------------------------------------------------------------------------
+#
+# The route shared the ``PUBLIC_API_PATHS`` allowlist with the static
+# ``/api/config/defaults`` from 2026-04, back when its handler returned a
+# fixed constant. It kept the exemption after the route started building the
+# document per request from the *requested* profile (discovered memory / voice
+# provider plugin names and the user's own custom-provider block names), so an
+# anonymous caller could read any profile's composition and time its own
+# plugin scan. ``?profile=`` made the route's own 404 a profile-name oracle.
+# These tests are the contract that replaces the allowlist entry: they hold on
+# both gates, because both consult that one set.
+
+_SCHEMA_PATH = "/api/config/schema"
+_BOGUS_PROFILE = "nonexistent-profile-for-auth-test"
+
+
+def _assert_schema_not_served(response, gate: str) -> None:
+    """Shared refusal check: 401, and no schema document in the body.
+
+    The two gates answer with different envelopes (the OAuth gate with its
+    ``error``/``reason``/``login_url`` JSON, the legacy gate with a bare
+    ``detail``), so this asserts only what both must never do: serve the
+    per-profile ``fields`` / ``category_order`` payload.
+    """
+    assert response.status_code == 401, (
+        f"{gate}: anonymous GET {_SCHEMA_PATH} returned {response.status_code} — "
+        "the route builds per-profile data and must not answer an anonymous "
+        "caller (allowlist: hermes_cli/dashboard_auth/public_paths.py)"
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {}
+    assert "fields" not in body and "category_order" not in body, (
+        f"{gate}: anonymous GET {_SCHEMA_PATH} served the schema document: "
+        f"{str(body)[:200]}"
+    )
+
+
+def test_gated_config_schema_refuses_anonymous_caller(gated_app):
+    """OAuth gate: a 401 JSON envelope, decided before the route runs."""
+    r = gated_app.get(_SCHEMA_PATH, follow_redirects=False)
+
+    _assert_schema_not_served(r, "OAuth gate")
+    body = r.json()
+    assert body["error"] == "unauthenticated"
+    assert body["reason"] == "no_cookie"
+    assert body["login_url"].startswith("/login")
+
+
+def test_gated_config_schema_serves_cookie_session(gated_app):
+    """Gating the route must not break the signed-in Config page."""
+    _complete_stub_login(gated_app)
+
+    r = gated_app.get(_SCHEMA_PATH)
+
+    assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+    body = r.json()
+    assert isinstance(body["fields"], dict) and body["fields"]
+    assert isinstance(body["category_order"], list)
+
+
+def test_gated_config_schema_profile_query_refuses_anonymous_caller(gated_app):
+    """The ``?profile=`` oracle stays closed: the profile scope answers an
+    unknown name with 404 ``Profile '…' does not exist.``, which confirms to an
+    anonymous caller which names DO exist. The gate has to answer first."""
+    r = gated_app.get(_SCHEMA_PATH, params={"profile": _BOGUS_PROFILE},
+                      follow_redirects=False)
+
+    _assert_schema_not_served(r, "OAuth gate")
+    assert "does not exist" not in r.text, (
+        "the profile-scope 404 reached an anonymous caller — profile names are "
+        "enumerable again through the schema route"
+    )
+
+
+def test_loopback_config_schema_refuses_anonymous_caller(loopback_app):
+    """Legacy loopback / ``--insecure`` gate (``web_server.auth_middleware``):
+    it imports the same allowlist, so the same entry removal gates it here."""
+    r = loopback_app.get(_SCHEMA_PATH)
+
+    _assert_schema_not_served(r, "loopback gate")
+
+
+def test_loopback_config_schema_serves_session_token(loopback_app):
+    """Loopback mode has no cookie; the SPA's session-token header opens it."""
+    r = loopback_app.get(
+        _SCHEMA_PATH,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+    assert r.json()["fields"]
+
+
+def test_loopback_config_schema_profile_query_refuses_anonymous_caller(loopback_app):
+    """Same oracle, other gate: 401, never the profile-scope 404."""
+    r = loopback_app.get(_SCHEMA_PATH, params={"profile": _BOGUS_PROFILE})
+
+    _assert_schema_not_served(r, "loopback gate")
+    assert "does not exist" not in r.text
 
 
 # ---------------------------------------------------------------------------

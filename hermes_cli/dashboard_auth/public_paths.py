@@ -13,9 +13,13 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Portal wildcard liveness probe (``docs/agent-dashboard-public-url-contract.md``,
     # NAS side): version, gateway state, session count, auth-gate shape. No secrets.
     "/api/status",
-    # Read-only config-defaults / schema feeds for the SPA's Config page.
+    # The static ``DEFAULT_CONFIG`` snapshot the SPA's Config page seeds from:
+    # identical bytes on every install, so a pre-login read leaks nothing.
+    # ``/api/config/schema`` is NOT here — it is built per request from the
+    # requested profile (discovered plugin provider names, the user's custom
+    # provider blocks) and belonged on this list only while its handler
+    # returned a fixed constant.
     "/api/config/defaults",
-    "/api/config/schema",
     # Read-only model metadata — same shape as public provider catalogs.
     "/api/model/info",
     # Read-only theme + plugin manifests for the dashboard skin engine.
