@@ -524,9 +524,13 @@ def _install_hangup_protection(gateway_mode: bool = False):
     """Protect ``cmd_update`` from SIGHUP (→ SIG_IGN, inherited by pip/git children) and broken pipes
     (stdio wrapped in ``_UpdateOutputStream``). SIGINT/SIGTERM are left alone — legitimate cancels.
     Gateway updates are already detached, but still need the log mirror for the
-    Desktop progress watchdog. Returns state for ``_finalize_update_output``."""
+    Desktop progress watchdog. stdin is bounded too (``update_cmd_wait``): this run holds the
+    install's update marker + checkout flock, which fences every cron run and worker admission in
+    the install, so no prompt of its may park on an unanswered stdin. Returns state for
+    ``_finalize_update_output``."""
     state = {
-        "prev_stdout": sys.stdout, "prev_stderr": sys.stderr, "log_file": None, "installed": False}
+        "prev_stdout": sys.stdout, "prev_stderr": sys.stderr, "prev_stdin": None,
+        "log_file": None, "installed": False}
 
     import signal as _signal
 
@@ -534,6 +538,15 @@ def _install_hangup_protection(gateway_mode: bool = False):
         # Non-main thread: update still runs, just without hangup protection.
         with contextlib.suppress(ValueError, OSError):
             _signal.signal(_signal.SIGHUP, _signal.SIG_IGN)
+
+    # Same "non-fatal" rule as the stdio wrap below: an unbounded stdin is still better than a
+    # broken update, and the fence watchdog is the backstop for that case.
+    try:
+        from hermes_cli.update_cmd_wait import bounded_stdin
+        state["prev_stdin"] = sys.stdin
+        sys.stdin = bounded_stdin(sys.stdin)
+    except Exception:  # health: allow BLE001 -- a failed stdin bound must not stop the update; the fence watchdog covers the unbounded case
+        state["prev_stdin"] = None
 
     # Any failure here is non-fatal; we just skip the wrap.
     try:
@@ -569,6 +582,9 @@ def _finalize_update_output(state):
             sys.stdout = state.get("prev_stdout", sys.stdout)
         with contextlib.suppress(Exception):
             sys.stderr = state.get("prev_stderr", sys.stderr)
+    if state.get("prev_stdin") is not None:  # bounded stdin is per-run, never left installed
+        with contextlib.suppress(Exception):
+            sys.stdin = state["prev_stdin"]
     log_file = state.get("log_file")
     if log_file is not None:
         with contextlib.suppress(Exception):
