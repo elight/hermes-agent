@@ -479,10 +479,15 @@ async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
 
 async def _advisory_pressure(status: dict[str, Any], home: Path) -> None:
     """Memory / disk pressure rollups + deferred FTS rebuild progress (coarse numbers/enums
-    only — but still host sizing, so an unverified caller on a gated bind does not get them;
-    see ``_UNVERIFIED_STATUS_KEYS``). Deliberately NOT folded into components/overall: pressure
-    is advisory, not a liveness verdict, and flipping ``overall`` on it would page NAS's
-    availability sweep for a condition the valve is already handling. Read-only, never raise.
+    only). Deliberately NOT folded into components/overall: pressure is advisory, not a
+    liveness verdict, and flipping ``overall`` on it would page NAS's availability sweep for
+    a condition the valve is already handling — that is a reason to keep pressure out of the
+    liveness verdict, NOT evidence that NAS skips this block: e11d1ddc7f (NS-656) added
+    ``memory`` for the same NAS-sweep audience as ``nous_session_valid``, so whether an
+    unverified caller on a gated bind gets it is Evan's open call on t_a4f3308c (see
+    ``_HOSTED_PROBE_STATUS_KEYS``). This branch withholds the block as host sizing;
+    ``disk``/``fts_rebuild`` name only the dashboard banner as their consumer (6977d21fa7).
+    Read-only, never raise.
     """
     for key, mod_name, fn_name in (("memory", "gateway.memory_status", "collect_memory_status"),
                                    ("disk", "gateway.disk_status", "collect_disk_status")):
@@ -546,15 +551,26 @@ _UNVERIFIED_STATUS_KEYS = frozenset({
 #: names its (out-of-repo) reader: ``profiles``/``gateway_mode`` are the Portal's
 #: profile list — 8d66e78844 (#60585), ``fly-provider.ts`` ``getInstanceRuntimeStatus``;
 #: ``nous_session_valid`` is the enum NAS re-mints the bootstrap session on at
-#: ``terminal`` (``auth_nous.py:1397-1399``); ``gateway_busy``/``gateway_drainable``
-#: are the NAS lifecycle-safety gate below; ``gateway_platforms``/``gateway_exit_reason``
+#: ``terminal`` (``auth_nous.py:1397-1399``); ``gateway_busy``/``gateway_drainable`` are
+#: 0ee75469d7's NAS lifecycle-safety gate; ``gateway_platforms``/``gateway_exit_reason``
 #: are the code-only per-platform verdict a sweep reads, which #90700 ruled public and
 #: this keeps — as codes, and with the merged ``<profile>:<platform>`` keys folded onto
 #: bare platform names (``status_public.py``), because the profile-to-bot pairing is the
 #: part of that field the card names. The Webapp keeps withholding all seven: a wildcard
 #: Webapp bind is reachable by everyone on the network (fd9ff2a0cd).
+#:
+#: OPEN, for Evan to rule (t_a4f3308c): three withheld fields ALSO have a documented
+#: out-of-repo NAS reader, so leaving them out is a decision to make, not to infer.
+#: ``memory`` — e11d1ddc7f (NS-656) added it as the "same disclosure class as the
+#: existing nous_session_valid field, added for the same NAS-sweep audience", and its
+#: NAS-side ingestion (agent-card notice + memory-tier upsell) ships separately.
+#: ``active_agents`` and ``restart_drain_timeout`` — 0ee75469d7 added both beside the
+#: busy/drainable pair above for "an external consumer (NAS)": the in-flight turn count it
+#: polls, and the seconds it sizes its poll deadline with. Withholding all three is the
+#: conservative default here; one name added to this frozenset reverses each on his ruling.
+#:
 #: Everything else — install identity, served/parked topology, host sizing, session
-#: counts — waits for the caller to be verified.
+#: counts — has no reader in reach of this repo and waits for the caller to be verified.
 _HOSTED_PROBE_STATUS_KEYS = frozenset({
     "profiles", "gateway_mode", "nous_session_valid", "gateway_busy", "gateway_drainable",
     "gateway_platforms", "gateway_exit_reason"})
