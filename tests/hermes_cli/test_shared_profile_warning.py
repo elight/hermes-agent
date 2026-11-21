@@ -163,26 +163,51 @@ def test_cli_startup_quarantines_corrupt_ledger(homes, tmp_path, corrupt):
         assert entries[0]["hermes_home"] == hermes_home_key(homes)
 
 
-def test_status_surfaces_live_warning_without_host_details(homes, tmp_path, monkeypatch):
+def test_status_surfaces_live_warning_for_the_signed_in_operator(homes, tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
-    from hermes_cli import web_server
 
-    monkeypatch.setattr(web_server.app.state, "auth_required", True, raising=False)
-    client = TestClient(web_server.app)
-    assert client.get("/api/status").json()["shared_profile_warning"] is False
-    with running_cli(homes, tmp_path / "canary"):
-        response = client.get("/api/status")
-        assert response.status_code == 200
-        assert response.json()["shared_profile_warning"] is True
-    assert client.get("/api/status").json()["shared_profile_warning"] is False
-    work = homes / "profiles" / "work"
-    work.mkdir(parents=True)
-    (work / "config.yaml").write_text("{}")
-    with running_install(work, tmp_path / "canary"):
-        assert client.get("/api/status").json()["shared_profile_warning"] is False
-        response = client.get("/api/status?profile=work")
-        assert response.status_code == 200
-        assert response.json()["shared_profile_warning"] is True
+    import plugins.dashboard_auth.basic as basic_plugin
+    from hermes_cli import web_server
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from hermes_cli.dashboard_auth.routes import _reset_password_rate_limit
+
+    # The flag drives a dashboard banner, so on a gated bind it is operator surface:
+    # ``_UNVERIFIED_STATUS_KEYS`` (status.py) withholds it from an anonymous caller, and the
+    # signed-in operator below is the reader the assertions have to exercise — including the
+    # ``?profile=`` switch, which an unverified caller no longer gets to run at all.
+    for key, value in (("auth_required", True), ("bound_host", "0.0.0.0"), ("bound_port", 9130),
+                       ("trusted_public_hosts", frozenset())):
+        monkeypatch.setattr(web_server.app.state, key, value, raising=False)
+    register_provider(basic_plugin.BasicAuthProvider(
+        username="admin", password_hash=basic_plugin.hash_password("pw"), secret=b"s" * 32))
+    _reset_password_rate_limit()
+    plaintext = "pw"  # what ``hash_password`` above hashed
+    try:
+        client = TestClient(web_server.app, base_url="http://192.168.50.220:9130")
+        assert "shared_profile_warning" not in client.get("/api/status").json()
+        login_body = {"provider": "basic", "username": "admin"} | dict(password=plaintext)
+        login = client.post("/auth/password-login", json=login_body)
+        assert login.status_code == 200, login.text
+
+        def warning(profile: str = "") -> bool:
+            return client.get(f"/api/status{profile}").json()["shared_profile_warning"]
+
+        assert warning() is False
+        with running_cli(homes, tmp_path / "canary"):
+            response = client.get("/api/status")
+            assert response.status_code == 200
+            assert response.json()["shared_profile_warning"] is True
+        assert warning() is False
+        work = homes / "profiles" / "work"
+        work.mkdir(parents=True)
+        (work / "config.yaml").write_text("{}")
+        with running_install(work, tmp_path / "canary"):
+            assert warning() is False
+            response = client.get("/api/status?profile=work")
+            assert response.status_code == 200
+            assert response.json()["shared_profile_warning"] is True
+    finally:
+        clear_providers()
 
 
 def test_warning_rejects_reused_or_unverifiable_process_identity(homes, tmp_path):

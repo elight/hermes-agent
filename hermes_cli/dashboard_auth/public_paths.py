@@ -18,14 +18,23 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Portal wildcard liveness probe (``docs/agent-dashboard-public-url-contract.md``,
     # NAS side). The only entry whose body is assembled per request, so its
     # boundary is inside the handler, not here: ``_status_caller_verified``
-    # decides, and ``redact_status_for_unverified``
-    # (``web_routers/status_public.py:45``) reduces an unverified caller's
-    # free-text diagnostics to lifecycle enums and source-controlled codes,
-    # while the ``if not auth["auth_required"]`` block keeps host paths, the
-    # gateway PID and ``gateways[]`` off a gated bind. An unverified caller on a
-    # gated bind still gets version, gateway state, session counts, the
-    # auth-gate shape, ``install_id``, the profile names and host memory/disk
-    # sizing — no credential, no session content, no path.
+    # decides, and a caller it cannot verify on a gated bind gets one named key
+    # set — ``_UNVERIFIED_STATUS_KEYS`` (``web_routers/status.py``): liveness
+    # (``version``, ``release_date``, ``gateway_running``, ``gateway_state``,
+    # ``overall``, ``components``) plus the sign-in shape (``auth_required``,
+    # ``auth_providers``, ``auth_flows``, ``peer_access``), and on the surfaces
+    # Hermes Cloud probes also ``_HOSTED_PROBE_STATUS_KEYS`` (``profiles``,
+    # ``gateway_mode``, ``nous_session_valid``, ``gateway_busy``,
+    # ``gateway_drainable``, and the code-only ``gateway_platforms`` with its
+    # ``<profile>:<platform>`` keys folded onto bare platform names, plus
+    # ``gateway_exit_reason``). Nothing else: no install id, no profile-to-platform
+    # pairing, no host sizing, no session counts, no paths, no credential. The same
+    # handler runs ``redact_status_for_unverified``
+    # (``web_routers/status_public.py:45``) for any unverified caller — it bounds
+    # adapter free-text to lifecycle enums and source-controlled codes on the
+    # loopback bind, where the body is not narrowed — and ignores an unverified
+    # caller's ``?profile=`` on every gated surface, because the scope lookup's
+    # 404 for an unknown name disclosed which profiles exist.
     "/api/status",
     # The static ``DEFAULT_CONFIG`` snapshot the SPA's Config page seeds from:
     # identical bytes on every install, so a pre-login read leaks nothing. The

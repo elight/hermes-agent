@@ -479,8 +479,9 @@ async def _component_health(gateway: dict[str, Any]) -> dict[str, Any]:
 
 async def _advisory_pressure(status: dict[str, Any], home: Path) -> None:
     """Memory / disk pressure rollups + deferred FTS rebuild progress (coarse numbers/enums
-    only; public payload). Deliberately NOT folded into components/overall: pressure is
-    advisory, not a liveness verdict, and flipping ``overall`` on it would page NAS's
+    only — but still host sizing, so an unverified caller on a gated bind does not get them;
+    see ``_UNVERIFIED_STATUS_KEYS``). Deliberately NOT folded into components/overall: pressure
+    is advisory, not a liveness verdict, and flipping ``overall`` on it would page NAS's
     availability sweep for a condition the valve is already handling. Read-only, never raise.
     """
     for key, mod_name, fn_name in (("memory", "gateway.memory_status", "collect_memory_status"),
@@ -525,14 +526,46 @@ def _fts_rebuild_status() -> Optional[dict[str, Any]]:
             "percent": min(100, int(100 * _rebuild.indexed / _rebuild.total))}
 
 
-#: What the gateway's Webapp answers a caller who has not signed in: liveness, version and the
-#: sign-in shape (the native-app login probe and uptime checks read nothing else). Profile names,
-#: the install id and host figures wait for sign-in, since a Webapp on a wildcard bind is reachable
-#: by everyone on the network. The standalone dashboard keeps its public body: Hermes Cloud reads
-#: the profile list there without a session (#60585).
-_WEBAPP_SIGNED_OUT_STATUS_KEYS = frozenset({
+#: What an unverified caller on a gated bind gets: liveness, version and the
+#: sign-in shape. Every entry names a credential-free reader on this branch —
+#: ``auth_required`` via Desktop's ``authModeFromStatus``
+#: (``apps/desktop/electron/connection-config.ts:1130``), ``auth_flows`` via
+#: ``statusSupportsNativeFlow`` (``native-oauth.ts:78``), ``version`` from the same
+#: probe (``global-remote-session-route.ts:172``), a verdict for uptime checks in
+#: ``gateway_running``/``gateway_state``/``overall`` and the ``components`` rollup
+#: behind it, and ``peer_access`` — the peer-pass contract the pass issuer reads
+#: before this agent holds any credential (``dashboard_auth/peer_pass.py:28-31``).
+#: This is the body the gateway's Webapp has answered a signed-out caller with
+#: since fd9ff2a0cd, so it is the accepted floor rather than a new guess.
+_UNVERIFIED_STATUS_KEYS = frozenset({
     "version", "release_date", "gateway_running", "gateway_state", "overall", "components",
-    "auth_required", "auth_providers", "auth_flows"})
+    "auth_required", "auth_providers", "auth_flows", "peer_access"})
+
+#: Added on every gated surface EXCEPT the Webapp, because the standalone
+#: dashboard is the listener Hermes Cloud / NAS probes with no cookie. Each entry
+#: names its (out-of-repo) reader: ``profiles``/``gateway_mode`` are the Portal's
+#: profile list — 8d66e78844 (#60585), ``fly-provider.ts`` ``getInstanceRuntimeStatus``;
+#: ``nous_session_valid`` is the enum NAS re-mints the bootstrap session on at
+#: ``terminal`` (``auth_nous.py:1397-1399``); ``gateway_busy``/``gateway_drainable``
+#: are the NAS lifecycle-safety gate below; ``gateway_platforms``/``gateway_exit_reason``
+#: are the code-only per-platform verdict a sweep reads, which #90700 ruled public and
+#: this keeps — as codes, and with the merged ``<profile>:<platform>`` keys folded onto
+#: bare platform names (``status_public.py``), because the profile-to-bot pairing is the
+#: part of that field the card names. The Webapp keeps withholding all seven: a wildcard
+#: Webapp bind is reachable by everyone on the network (fd9ff2a0cd).
+#: Everything else — install identity, served/parked topology, host sizing, session
+#: counts — waits for the caller to be verified.
+_HOSTED_PROBE_STATUS_KEYS = frozenset({
+    "profiles", "gateway_mode", "nous_session_valid", "gateway_busy", "gateway_drainable",
+    "gateway_platforms", "gateway_exit_reason"})
+
+
+def _unverified_status_keys(state: Any) -> frozenset[str]:
+    """The exact key set an unverified caller may read on this surface."""
+    from hermes_cli.web_server_surface import surface
+    if surface(state) == "webapp":
+        return _UNVERIFIED_STATUS_KEYS
+    return _UNVERIFIED_STATUS_KEYS | _HOSTED_PROBE_STATUS_KEYS
 
 
 async def _status_caller_verified(request: Request) -> bool:
@@ -552,28 +585,45 @@ async def _status_caller_verified(request: Request) -> bool:
     return True
 
 
-def _webapp_caller_signed_out(request: Request, verified: bool) -> bool:
-    """True when this request reached the gateway's Webapp behind its sign-in gate unverified."""
-    from hermes_cli.web_server_surface import surface
-    return (not verified and surface(request.app.state) == "webapp"
-            and bool(getattr(request.app.state, "auth_required", False)))
+def _caller_signed_out_on_gated_surface(request: Request, verified: bool) -> bool:
+    """True when the request reached a gated listener that could not verify the caller.
+
+    On EVERY gated surface, not only the Webapp: a standalone ``hermes dashboard``
+    on a wildcard bind is exactly as reachable, and narrowing only the Webapp left
+    that listener running the ``?profile=`` scope lookup for anonymous callers,
+    whose 404 answered which profile names exist.
+    """
+    return not verified and bool(getattr(request.app.state, "auth_required", False))
 
 
 @router.get("/api/status")
 async def get_status(profile: Optional[str] = None,
                      request: Request = None):  # type: ignore[assignment]  # None when awaited in-process
-    """Public machine-level liveness probe (``PUBLIC_API_PATHS``): version, gateway state,
-    active session count and the auth-gate shape — no bodies, no session content, no secrets.
+    """Public machine-level liveness probe (``PUBLIC_API_PATHS``).
+
+    An unverified caller on a gated bind gets only the key set
+    :func:`_unverified_status_keys` names — liveness (``version``, ``release_date``,
+    ``gateway_running``, ``gateway_state``, ``overall``, ``components``) and the
+    sign-in shape (``auth_required``, ``auth_providers``, ``auth_flows``,
+    ``peer_access``), plus on the surfaces Hermes Cloud probes the hosted reads
+    (``profiles``, ``gateway_mode``, ``nous_session_valid``, ``gateway_busy``,
+    ``gateway_drainable``, and the code-only ``gateway_platforms``/``gateway_exit_reason``
+    with their merged keys folded onto bare platform names). No install identity, no
+    profile-to-platform pairing, no host sizing, no session counts, no paths, no
+    credential. A caller the gate would accept, and any loopback listener, gets the
+    full body.
 
     ``?profile=`` (dashboard management switcher) uses the config-only contextvar scope, NOT
     _profile_scope: this handler awaits the remote health probe, and _profile_scope holds a
-    process-wide lock that must never be held across an await.
+    process-wide lock that must never be held across an await. An unverified caller's value is
+    ignored: the scope lookup's 404 for an unknown name was a profile-name oracle.
     """
     from hermes_cli.web_server import _GATEWAY_HEALTH_URL
     verified = await _status_caller_verified(request)
-    signed_out = _webapp_caller_signed_out(request, verified)
+    signed_out = _caller_signed_out_on_gated_surface(request, verified)
     status_scope = None
-    # A signed-out caller's ``?profile=`` is ignored: an unknown name's 404 would tell it which exist.
+    # An unverified caller's ``?profile=`` is ignored on EVERY gated surface: the
+    # scope lookup's 404 for an unknown name would tell it which profiles exist.
     requested_profile = "" if signed_out else (profile or "").strip()
     profile_dir: Optional[Path] = None
     if requested_profile and requested_profile.lower() != "current":
@@ -645,9 +695,12 @@ async def get_status(profile: Optional[str] = None,
                              else "degraded")
         await _advisory_pressure(status, profile_dir if profile_dir else get_hermes_home())
 
-        # Profile NAMES and ``gateway_mode`` are low-sensitivity product surface (Hermes Cloud
-        # renders the profile list over a gated bind) so they survive the auth gate; the
-        # per-gateway ``gateways[]`` carries host ports and stays gated below.
+        # Profile NAMES and ``gateway_mode`` are what Hermes Cloud renders its profile list
+        # from over a gated bind with no credential (#60585), so they survive the gate for an
+        # unverified caller on the surfaces it probes (``_HOSTED_PROBE_STATUS_KEYS``); the
+        # per-gateway ``gateways[]`` carries host ports and stays gated below, and
+        # ``parked_profiles``/``isolated_profile``/``multiplex_standalone_reason`` are the
+        # dashboard's own operator surface, which is post-sign-in.
         # An operator's `-p <name> serve --isolated` lists only <name>: a listing choice, not a
         # boundary (hermes_cli/isolated_scope.py).
         status["profiles"] = scope_to_launch_profile(topology["profiles"])
@@ -666,9 +719,12 @@ async def get_status(profile: Optional[str] = None,
                 "gateway_health_url": _GATEWAY_HEALTH_URL, "gateways": topology["gateways"]})
 
         if not verified:
+            # Belt and braces for the loopback bind, where the body is not narrowed: adapter
+            # exception prose still must not reach a caller the gate would refuse.
             redact_status_for_unverified(status)
         if signed_out:
-            return {key: value for key, value in status.items() if key in _WEBAPP_SIGNED_OUT_STATUS_KEYS}
+            keys = _unverified_status_keys(request.app.state)
+            return {key: value for key, value in status.items() if key in keys}
         return status
     finally:
         if status_scope is not None:

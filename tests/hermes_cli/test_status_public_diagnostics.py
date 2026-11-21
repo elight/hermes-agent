@@ -1,7 +1,8 @@
 """``/api/status`` is public (``PUBLIC_API_PATHS``), so an unverified caller gets the gateway's
 diagnostics only as bounded codes: free-text adapter ``error_message``, any adapter-specific
 platform field, the raw ``gateway_exit_reason`` and the multiplex remediation prose stay for a
-caller the auth gate would accept (#90700).
+caller the auth gate would accept (#90700). The multiplexer's merged ``<profile>:<platform>``
+keys are likewise folded onto the bare platform name for that caller.
 """
 from __future__ import annotations
 
@@ -69,7 +70,9 @@ def test_anonymous_status_carries_codes_not_diagnostic_text(gated):
         "state": "fatal", "error_code": "telegram_polling_conflict", "needs_attention": True,
         "updated_at": "2026-01-01T00:00:00+00:00"}}
     assert body["gateway_exit_reason"] == "auth_failed"
-    assert body["multiplex_standalone_reason"] is None
+    # On a gated bind the remediation prose leaves the payload entirely (the key is
+    # withheld); the loopback arm below still proves the redaction itself nulls it.
+    assert "multiplex_standalone_reason" not in body
 
 
 def test_signed_in_operator_keeps_full_diagnostics(gated):
@@ -101,6 +104,45 @@ def test_hostile_platform_values_are_bounded(gated, monkeypatch):
     assert resp.json()["gateway_platforms"] == {"telegram": {"state": "fatal"}}
     # A source-controlled code already is the bounded form and passes through unchanged.
     assert resp.json()["gateway_exit_reason"] == "loop_liveness_watchdog"
+
+
+def test_merged_profile_platform_keys_reach_an_anonymous_caller_folded(gated, monkeypatch):
+    """The multiplexer merges a served profile's entries as ``<profile>:<platform>``; the
+    profile-to-bot pairing is per-profile detail, so an anonymous caller gets the platform
+    alone with the worst state winning, and a signed-in operator keeps the merged keys."""
+    monkeypatch.setattr(_gw_status, "read_runtime_status", lambda *a, **k: {
+        **RUNTIME,
+        "platforms": {
+            "telegram": {"state": "connected", "updated_at": "2026-01-01T00:00:00+00:00"},
+            "coder:telegram": {"state": "fatal", "error_code": "telegram_polling_conflict",
+                               "error_message": f"409 conflict for {SECRET}",
+                               "updated_at": "2026-01-01T00:00:00+00:00"}}})
+    body = gated.get("/api/status").json()
+    assert body["gateway_platforms"] == {
+        "telegram": {"state": "fatal", "error_code": "telegram_polling_conflict",
+                     "updated_at": "2026-01-01T00:00:00+00:00"}}
+    assert SECRET not in gated.get("/api/status").text
+
+    plaintext = "pw"  # what the module's own ``password_hash`` fixture hashed
+    login_body = {"provider": "basic", "username": "admin"} | dict(password=plaintext)
+    login = gated.post("/auth/password-login", json=login_body)
+    assert login.status_code == 200, login.text
+    merged = gated.get("/api/status").json()["gateway_platforms"]
+    assert merged["coder:telegram"]["state"] == "fatal"
+    assert SECRET in merged["coder:telegram"]["error_message"]
+
+
+def test_the_fold_keeps_every_platform_and_never_a_profile_key():
+    """The fold is per platform, worst-state-first, and cannot emit a profile-prefixed key."""
+    from hermes_cli.web_routers.status_public import redact_status_for_unverified
+    status = {"gateway_platforms": {
+        "coder:telegram": {"state": "connected"},
+        "research:telegram": {"state": "fatal"},
+        "discord": {"state": "disconnected"},
+        "coder:discord": {"state": "connected"}}}
+    redact_status_for_unverified(status)
+    assert status["gateway_platforms"] == {"telegram": {"state": "fatal"},
+                                           "discord": {"state": "disconnected"}}
 
 
 def test_loopback_dashboard_gates_detail_on_the_session_token(gated, monkeypatch):
