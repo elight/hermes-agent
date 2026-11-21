@@ -108,9 +108,6 @@ def test_gated_status_is_public(gated_app):
 @pytest.mark.parametrize("path", [
     "/api/health",
     "/api/config/defaults",
-    "/api/model/info",
-    "/api/dashboard/themes",
-    "/api/dashboard/plugins",
 ])
 def test_other_public_api_paths_are_public_under_gate(gated_app, path):
     """Every remaining entry in the shared ``PUBLIC_API_PATHS`` allowlist must
@@ -119,11 +116,20 @@ def test_other_public_api_paths_are_public_under_gate(gated_app, path):
     be re-made whenever the payload changes: ``/api/config/schema`` sat here
     from April 2026 while it returned a fixed constant and stayed after July
     2026 when it began building per-profile data per request, so an anonymous
-    caller could read any profile's composition. Its replacement contract is
-    ``test_gated_config_schema_*`` / ``test_loopback_config_schema_*`` below;
-    the pre-login argument in the old docstring never held anyway, because
-    ``GET /`` and ``GET /config`` 302 to ``/login`` and the server-rendered
-    ``/login`` page fetches no ``/api/`` path.
+    caller could read any profile's composition; ``/api/model/info``,
+    ``/api/dashboard/themes`` and ``/api/dashboard/plugins`` were listed the
+    same month against a payload that was already per-install. Their
+    replacement contracts are ``test_gated_config_schema_*``,
+    ``test_loopback_config_schema_*`` and ``*_disclosure_route_*`` below.
+
+    What does NOT justify an entry: "the SPA pre-loads it before login". With
+    exactly one interactive OAuth provider registered, ``GET /`` 302s to the
+    server-rendered ``/login``, which fetches no ``/api/`` path at all; where a
+    password provider is also registered the shell IS served pre-login, and
+    then a 401 on an ``/api/`` request is the designed sign-in trigger — the
+    gate answers JSON with ``login_url`` and the SPA navigates to it
+    (``web/src/lib/api.ts:222``), instead of rendering a page that silently
+    shows no data. See ``test_a_401_from_getThemes_bounces_to_sign_in``.
 
     Accept any non-auth-failure status: 200 when the route succeeds,
     or any route-specific error (e.g. 400 / 404 / 500 from a missing
@@ -618,6 +624,146 @@ def test_loopback_config_schema_profile_query_refuses_anonymous_caller(loopback_
     r = loopback_app.get(_SCHEMA_PATH, params={"profile": _BOGUS_PROFILE})
 
     _assert_schema_not_served(r, "loopback gate")
+    assert "does not exist" not in r.text
+
+
+# ---------------------------------------------------------------------------
+# The three per-install disclosure routes: /api/model/info,
+# /api/dashboard/themes, /api/dashboard/plugins
+#
+# Same class as the schema route above — allowlisted in ``99bcc2de5b``
+# (2026-04-14) against a payload that was already per-install — and each one
+# answers an anonymous caller with data about THIS host:
+#
+#   * ``/api/model/info``   — the live model + provider read out of
+#     ``load_config()`` (web_routers/models.py:146-151); the all-empty
+#     ``_EMPTY_MODEL_INFO`` its allowlist comment implied was only ever a
+#     fallback. ``?profile=`` makes it a per-profile reader, and resolving the
+#     context length dials the operator's model endpoint carrying that
+#     profile's own key (models.py:64-78).
+#   * ``/api/dashboard/themes`` — the built-in list plus, for every
+#     operator-authored theme, its whole normalised definition from
+#     ``~/.hermes/dashboard-themes/*.yaml`` (web_routers/dashboard_ui.py:61-68).
+#   * ``/api/dashboard/plugins`` — the installed-plugin inventory: names,
+#     versions, source (dashboard_ui.py:111-122).
+#
+# Each entry is replaced by this contract rather than simply dropped, and the
+# signed-in half is the control: gating must not break the theme picker, the
+# sidebar model badge or the plugin tabs.
+# ---------------------------------------------------------------------------
+
+
+def _serves_model_info(body) -> bool:
+    """/api/model/info's document, in its configured and its no-model shape."""
+    return isinstance(body, dict) and "capabilities" in body and "provider" in body
+
+
+def _serves_theme_list(body) -> bool:
+    return isinstance(body, dict) and isinstance(body.get("themes"), list)
+
+
+def _serves_plugin_list(body) -> bool:
+    # The plugins route answers a bare JSON array, unlike every other body here.
+    return isinstance(body, list)
+
+
+_GATED_DISCLOSURE_ROUTES = (
+    ("/api/model/info", _serves_model_info),
+    ("/api/dashboard/themes", _serves_theme_list),
+    ("/api/dashboard/plugins", _serves_plugin_list),
+)
+_DISCLOSURE_IDS = [path for path, _ in _GATED_DISCLOSURE_ROUTES]
+
+
+def _assert_document_withheld(response, serves, path: str, gate: str) -> None:
+    """Shared refusal check: 401, and the route's own document is not in the body.
+
+    The two gates answer with different envelopes (the OAuth gate with its
+    ``error``/``reason``/``login_url`` JSON, the legacy gate with a bare
+    ``detail``), so this asserts only what both must never do: serve the
+    per-install payload.
+    """
+    assert response.status_code == 401, (
+        f"{gate}: anonymous GET {path} returned {response.status_code} — the route "
+        "answers with per-install data and must not serve an anonymous caller "
+        "(allowlist: hermes_cli/dashboard_auth/public_paths.py)"
+    )
+    try:
+        body = response.json()
+    except ValueError:
+        body = None
+    assert not serves(body), (
+        f"{gate}: anonymous GET {path} served its document: {str(body)[:200]}"
+    )
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_gated_disclosure_route_refuses_anonymous_caller(gated_app, path, serves):
+    """OAuth gate: a 401 JSON envelope, decided before the route runs."""
+    r = gated_app.get(path, follow_redirects=False)
+
+    _assert_document_withheld(r, serves, path, "OAuth gate")
+    body = r.json()
+    assert body["error"] == "unauthenticated"
+    assert body["reason"] == "no_cookie"
+    assert body["login_url"].startswith("/login")
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_gated_disclosure_route_serves_cookie_session(gated_app, path, serves):
+    """Gating must not break the signed-in surface behind the route: the theme
+    picker, the sidebar model badge and the plugin tabs all read it."""
+    _complete_stub_login(gated_app)
+
+    r = gated_app.get(path)
+
+    assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+    assert serves(r.json()), f"{path} answered something other than its document: {r.text[:200]}"
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_gated_disclosure_route_profile_query_refuses_anonymous_caller(gated_app, path, serves):
+    """The ``?profile=`` oracle stays closed: the profile scope answers an
+    unknown name with 404 ``Profile '…' does not exist.``, which confirms to an
+    anonymous caller which names DO exist. The gate has to answer first."""
+    r = gated_app.get(path, params={"profile": _BOGUS_PROFILE}, follow_redirects=False)
+
+    _assert_document_withheld(r, serves, path, "OAuth gate")
+    assert "does not exist" not in r.text, (
+        f"the profile-scope 404 reached an anonymous caller — profile names are "
+        f"enumerable again through {path}"
+    )
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_loopback_disclosure_route_refuses_anonymous_caller(loopback_app, path, serves):
+    """Legacy loopback / ``--insecure`` gate (``web_server.auth_middleware``):
+    it imports the same allowlist, so the same entry removal gates it here."""
+    r = loopback_app.get(path)
+
+    _assert_document_withheld(r, serves, path, "loopback gate")
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_loopback_disclosure_route_serves_session_token(loopback_app, path, serves):
+    """Loopback mode has no cookie; the SPA's session-token header opens it."""
+    r = loopback_app.get(
+        path,
+        headers={web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN},
+    )
+
+    assert r.status_code == 200, f"{r.status_code}: {r.text[:300]}"
+    assert serves(r.json()), f"{path} answered something other than its document: {r.text[:200]}"
+
+
+@pytest.mark.parametrize("path,serves", _GATED_DISCLOSURE_ROUTES, ids=_DISCLOSURE_IDS)
+def test_loopback_disclosure_route_profile_query_refuses_anonymous_caller(loopback_app, path, serves):
+    """Same oracle, other gate: 401, never the profile-scope 404. The
+    credentialed half of that contract stays a 404 — pinned by
+    ``test_web_server_profile_unification.py::test_model_info_unknown_profile_404``."""
+    r = loopback_app.get(path, params={"profile": _BOGUS_PROFILE})
+
+    _assert_document_withheld(r, serves, path, "loopback gate")
     assert "does not exist" not in r.text
 
 

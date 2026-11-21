@@ -1341,10 +1341,15 @@ CONFIG_SCHEMA = ProviderConfigSchema(
         # Public endpoints should still work
         resp = unauth_client.get("/api/status")
         assert resp.status_code == 200
+        # /api/dashboard/plugins reads this install's plugin inventory, so it is
+        # gated like /api/dashboard/plugins/rescan beside it — an anonymous
+        # caller gets the refusal, not the list.
         resp = unauth_client.get("/api/dashboard/plugins")
-        assert resp.status_code == 200
+        assert resp.status_code == 401
         resp = unauth_client.get("/api/dashboard/plugins/rescan")
         assert resp.status_code == 401
+        resp = self.client.get("/api/dashboard/plugins")
+        assert resp.status_code == 200
         resp = self.client.get("/api/dashboard/plugins/rescan")
         assert resp.status_code == 200
 
@@ -3447,53 +3452,8 @@ class TestDenormalizeProviderSwitch:
         assert cfg_path.read_bytes() == before
 
 
-class TestModelInfoEndpoint:
-    """Tests for GET /api/model/info endpoint."""
-
-    @pytest.fixture(autouse=True)
-    def _setup(self):
-        try:
-            from starlette.testclient import TestClient
-        except ImportError:
-            pytest.skip("fastapi/starlette not installed")
-        from hermes_cli.web_server import app
-        self.client = TestClient(app)
-
-
-    def test_model_info_with_dict_config(self, monkeypatch):
-
-        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
-            "model": {
-                "default": "anthropic/claude-opus-4.6",
-                "provider": "openrouter",
-                "context_length": 100000,
-            }
-        })
-
-        with patch("agent.model_metadata.get_model_context_length", return_value=200000):
-            resp = self.client.get("/api/model/info")
-
-        data = resp.json()
-        assert data["model"] == "anthropic/claude-opus-4.6"
-        assert data["provider"] == "openrouter"
-        assert data["auto_context_length"] == 200000
-        assert data["config_context_length"] == 100000
-        assert data["effective_context_length"] == 100000  # override wins
-
-
-    def test_model_info_graceful_on_metadata_error(self, monkeypatch):
-        """Endpoint should return zeros on import/resolution errors, not 500."""
-
-        monkeypatch.setattr(_cfg_mod, "load_config", lambda: {
-            "model": "some/obscure-model"
-        })
-
-        with patch("agent.model_metadata.get_model_context_length", side_effect=Exception("boom")):
-            resp = self.client.get("/api/model/info")
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["auto_context_length"] == 0
+# TestModelInfoEndpoint moved to test_web_server_model_info.py with the route:
+# /api/model/info is gated now, so its handler tests carry a session token.
 
 
 # ---------------------------------------------------------------------------
