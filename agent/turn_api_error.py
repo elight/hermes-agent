@@ -16,6 +16,7 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
+from agent.capacity_wait import capacity_wait_verdict
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
@@ -148,6 +149,17 @@ def handle_api_error(
     )
     if _recovered:
         return _verdict("continue")
+
+    # Cron capacity wait: a local-engine "at capacity" 429 with a provider retry hint means
+    # the slot is busy, not the request broken — sit the hint out and retry the SAME model
+    # without burning the ladder or arming a fallback. Every other surface/verdict is
+    # untouched. See agent/capacity_wait.py.
+    _cw_action, _cw_result = capacity_wait_verdict(
+        agent, api_error=api_error, classified=classified, _retry=_retry,
+        messages=messages, conversation_history=conversation_history, api_call_count=api_call_count,
+    )
+    if _cw_action is not None:
+        return _verdict(_cw_action, _cw_result)
 
     retry_count += 1
     elapsed_time = time.time() - api_start_time

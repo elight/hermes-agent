@@ -926,6 +926,29 @@ under `~/.hermes/cron/output/` for triage. The marker is strict: mentioning or q
 else in a report leaves the run successful. Script-only (`no_agent`) jobs ignore it — a script signals failure
 with a non-zero exit code.
 
+## Capacity wait on a local engine
+
+When a local inference engine (gpud-style single-slot tenants, Ollama, llama.cpp behind a
+queue) is already busy with a long run, it can answer a new request with HTTP 429
+"at capacity" and a `Retry-After` hint meaning *try the same model in N seconds*. For a cron
+job that is not a failure — the slot will free up. Instead of burning the generic API-retry
+ladder (`agent.api_max_retries`, ~2 minutes) and failing, the job **waits** the hinted time
+and retries the same model, up to a wall-clock budget:
+
+```yaml
+# ~/.hermes/config.yaml
+cron:
+  capacity_wait_seconds: 2400   # 40 minutes; 0 disables the capacity wait
+```
+
+Per job the effective budget is `min(capacity_wait_seconds, the job's schedule interval)` —
+waiting past the job's next fire is pointless because that fire is skipped as "already
+running". When the budget is exhausted the job falls back to today's normal retry behaviour
+and fails as before; a waiting run keeps touching activity, so the inactivity watchdog
+(`HERMES_CRON_TIMEOUT`) never cuts it off. Only cron waits: chat, gateway, TUI and dashboard
+sessions keep the previous behaviour. Waits are logged at INFO ("Local-engine capacity
+wait"); the give-up is logged at WARNING.
+
 ## Script timeout
 
 Pre-run scripts (attached via the `script` parameter) have a default timeout of 3600 seconds (1 hour). This bounds the **script only** — skill-based / LLM-driven jobs run on a separate inactivity budget and are not capped by this value. If your scripts need a different limit, you can change it:

@@ -1785,26 +1785,26 @@ DEFAULT_CONFIG = {
     "cron": {
         "catch_up_missed": True,  # False skips recurring misses beyond the local grace window.
         # Let cron-spawned agents use the cronjob toolset (the "cron-librarian" pattern). Off by
-        # default: policy-denied in cron context to prevent unattended scheduling loops. Jobs
-        # created this way are user-owned in the same flat jobs table. Interactive toolsets
-        # (messaging/clarify) stay denied in cron regardless.
+        # default: policy-denied in cron context to prevent unattended scheduling loops; jobs
+        # created this way are user-owned in the same flat jobs table (interactive toolsets denied).
         "allow_agent_scheduling": False,
-        # Pre-dispatch validation: before building any agent machinery, verify the provider API key
-        # resolves (unless a fallback chain exists), attached skills are ready, and delivery
-        # platforms are configured. Failure -> last_status=blocked_config, ONE alert, no LLM call.
-        # False = fail during the run instead.
+        # Pre-dispatch validation: verify the API key resolves (unless a fallback chain exists),
+        # attached skills are ready, and delivery platforms are configured before building agent
+        # machinery. Failure -> last_status=blocked_config, ONE alert, no LLM call; False = fail in-run.
         "preflight": True,
+        # Capacity wait (cron only): sit out local-engine "at capacity" 429 hints (up to
+        # min(this, the job's interval) of wall clock) on the SAME model, no api_max_retries burn. 0 disables.
+        "capacity_wait_seconds": 2400,
         # Default model for cron jobs (WHAT model runs). Fire-time resolution: per-job pin >
-        # cron.model > model.default (the main agent model). An unpinned job follows the main
-        # model on every run; cron.model decouples the whole fleet from chat. "" = fall through.
+        # cron.model > model.default; unpinned follows the main model. "" = fall through.
         "model": "",
         # Inference provider paired with cron.model (NOT the scheduler provider below). "" = resolve
         # from global config.
         "model_provider": "",
-        # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
-        # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
-        # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable
-        # provider falls back to the built-in so cron never loses its trigger.
+        # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker; name an
+        # installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/<name>/), e.g.
+        # "chronos" (NAS-mediated managed cron for scale-to-zero). Unknown/unavailable falls back to
+        # the built-in so cron never loses its trigger.
         "provider": "",
         # Chronos settings; consulted only when provider == "chronos". All non-secret — the agent
         # holds NO scheduler credentials (provision reuses the Nous Portal token).
@@ -1812,8 +1812,8 @@ DEFAULT_CONFIG = {
             # NAS/portal base URL that arms/cancels one-shots and mints the inbound fire JWT (used
             # as the expected issuer).
             "portal_url": "https://portal.nousresearch.com",
-            # This agent's publicly reachable base URL; NAS POSTs {callback_url}/api/cron/fire. ""
-            # -> Chronos unavailable, resolver falls back to the built-in ticker.
+            # This agent's publicly reachable base URL; NAS POSTs {callback_url}/api/cron/fire.
+            # "" -> Chronos unavailable, resolver falls back to the built-in ticker.
             "callback_url": "",
             "expected_audience": "",  # Expected JWT audience (e.g. "agent:{instance_id}").
             # NAS JWKS URL for verifying the fire JWT signature. "" -> the fire endpoint refuses all

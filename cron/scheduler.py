@@ -530,6 +530,8 @@ from cron.executions import (
     get_execution, mark_execution_handoff_pending, mark_execution_running,
     recover_interrupted_executions, settle_unstarted_execution, terminalize_dead_owner)
 from cron.scheduler_liveness import ExecutionProgressStamper, _inactivity_watchdog_loop
+from cron.scheduler_intervals import _cron_interval_minutes, _job_interval_minutes
+from cron.scheduler_capacity_wait import attach_capacity_wait_budget
 from cron.scheduler_bookkeeping import _classify_delivery_outcome
 from cron.cancellation import (CancelRequest, _CancelEventLike, _CombinedCancelEvent, cancel_reason,
                                clear_cancel, finish_lost_execution,
@@ -869,57 +871,6 @@ def _inflight_min_allowance_minutes() -> float:
                 raw,
                 _INFLIGHT_MIN_ALLOWANCE_MINUTES)
     return _INFLIGHT_MIN_ALLOWANCE_MINUTES
-
-
-# expr -> minutes; cadence never changes, so avoid re-evaluating croniter every tick.
-_cron_interval_cache: dict = {}
-
-
-def _cron_interval_minutes(expr: str) -> Optional[float]:
-    """Cron expression cadence (gap between next two fires) in minutes; None -> floor allowance."""
-    if expr in _cron_interval_cache:
-        return _cron_interval_cache[expr]
-    result = None
-    ok = False
-    with contextlib.suppress(Exception):
-        from cron.jobs import _ensure_croniter
-
-        ok = _ensure_croniter()
-        if ok:
-            from cron.jobs import croniter as _croniter
-            from datetime import datetime
-
-            base = datetime.now()
-            it = _croniter(expr, base)
-            first = it.get_next(datetime)
-            second = it.get_next(datetime)
-            gap = (second - first).total_seconds() / 60.0
-            result = gap if gap > 0 else None
-    # Cache a real cadence or a bad-expr None (croniter loaded, expr invalid: stable). Skip the
-    # None from a transient croniter ImportError so it can't pin the floor allowance for the
-    # process lifetime once the import recovers.
-    if result is not None or ok:
-        _cron_interval_cache[expr] = result
-    return result
-
-
-def _job_interval_minutes(job: dict) -> Optional[float]:
-    """Best-effort job interval in minutes (None if unknown / one-shot -> floor). ``schedule`` is
-    persisted as a parsed dict; the string path is only a fallback for programmatic callers."""
-    with contextlib.suppress(Exception):
-        schedule = job.get("schedule")
-        if isinstance(schedule, str) and schedule.strip():
-            from cron.jobs import parse_schedule
-
-            schedule = parse_schedule(schedule) or {}
-        if isinstance(schedule, dict):
-            kind = schedule.get("kind")
-            if kind == "interval":
-                minutes = schedule.get("minutes")
-                return float(minutes) if minutes else None
-            if kind == "cron":
-                return _cron_interval_minutes(str(schedule.get("expr") or ""))
-    return None
 
 
 def get_inflight_guard_stats() -> dict:
@@ -2481,7 +2432,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
-    return AIAgent(
+    agent = AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
         base_url=runtime.get("base_url"),
@@ -2513,6 +2464,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         session_id=session_id,
         session_db=session_db,
     )
+    # Capacity-wait budget for local-engine "at capacity" 429s, capped by this job's schedule
+    # interval (agent/capacity_wait.py reads these; 0 disables).
+    attach_capacity_wait_budget(agent, job, _cfg)
+    return agent
 
 
 class _FireAudit:

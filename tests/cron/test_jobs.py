@@ -908,11 +908,11 @@ class TestMarkJobRun:
         assert jobs_mod._ensure_croniter() is False
         assert jobs_mod.compute_next_run(job["schedule"]) is None
         # The in-flight guard's cadence cache must not pin the import-failure None either.
-        import cron.scheduler as sched_mod
+        import cron.scheduler_intervals as intervals_mod
         expr = job["schedule"]["expr"]
-        sched_mod._cron_interval_cache.pop(expr, None)
-        assert sched_mod._cron_interval_minutes(expr) is None
-        assert expr not in sched_mod._cron_interval_cache, "import-failure None was cached"
+        intervals_mod._cron_interval_cache.pop(expr, None)
+        assert intervals_mod._cron_interval_minutes(expr) is None
+        assert expr not in intervals_mod._cron_interval_cache, "import-failure None was cached"
         mark_job_run(job["id"], success=True)  # leaves state=error, next_run_at=None
 
         # Window over (import works again); HAS_CRONITER is left untouched.
