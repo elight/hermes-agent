@@ -47,7 +47,7 @@ def _sleeper():
 
 
 def _completed_card_with_worker(conn, proc, *, ended_ago: int = 600) -> tuple[str, int]:
-    tid = kb.create_task(conn, title="finished", assignee="coder")
+    tid = kb.create_task(conn, title="finished", assignee="coder", created_by="tester")
     kb.claim_task(conn, tid, claimer=kb._claimer_id())
     run_id = kb._current_run_id(conn, tid)
     kbd._set_worker_pid(conn, tid, proc.pid)

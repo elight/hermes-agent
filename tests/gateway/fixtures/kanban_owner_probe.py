@@ -95,7 +95,7 @@ def main():
         tid = kb.create_task(conn, title='KANBAN_TASK_SENTINEL', body='Acceptance: finish owned card', assignee='default',
             workspace_kind='dir', workspace_path=str(workspace), skills=['owned-skill'],
             goal_mode=peer.mode == 'complete', goal_max_turns=2,
-            max_runtime_seconds=3600 if peer.mode == 'timeout' else None)
+            max_runtime_seconds=3600 if peer.mode == 'timeout' else None, created_by="tester")
     env = dict(os.environ)
     receipt, clients = {}, []
     original_popen = subprocess.Popen

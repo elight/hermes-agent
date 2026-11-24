@@ -24,7 +24,7 @@ def conn(tmp_path, monkeypatch):
 
 
 def _ready_task(conn) -> str:
-    tid = kb.create_task(conn, title="demo", assignee="coder")
+    tid = kb.create_task(conn, title="demo", assignee="coder", created_by="tester")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     return tid
 
@@ -61,7 +61,7 @@ def test_whitespace_stored_result_does_not_count(conn):
 
 
 def test_review_approval_exempt(conn):
-    tid = kb.create_task(conn, title="review-me", assignee="coder")
+    tid = kb.create_task(conn, title="review-me", assignee="coder", created_by="tester")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     assert kb.request_review(conn, tid, summary="please look") is True
     assert kb.get_task(conn, tid).status == "review"

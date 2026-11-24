@@ -34,7 +34,7 @@ def conn(tmp_path, monkeypatch):
 
 
 def _claimed_running_task(conn, *, live_worker: bool = True) -> tuple[str, int]:
-    tid = kb.create_task(conn, title="live", assignee="coder")
+    tid = kb.create_task(conn, title="live", assignee="coder", created_by="tester")
     assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
     if live_worker:
         # This process stands in for the spawned worker: alive, fingerprinted.
@@ -72,7 +72,7 @@ def test_claimless_complete_of_claim_without_live_worker_unchanged(conn):
 
 def test_claimless_complete_of_unclaimed_card_unchanged(conn):
     """The legitimate manual flow — completing a card nobody is working on — needs no proof."""
-    tid = kb.create_task(conn, title="admin", assignee="coder")
+    tid = kb.create_task(conn, title="admin", assignee="coder", created_by="tester")
     assert kb.complete_task(conn, tid, result="done") is True
     assert conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()["status"] == "done"
 

@@ -72,7 +72,7 @@ def _patch_list_profiles(names: list[str]):
 
 def test_decompose_with_fanout_creates_children(kanban_home):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship a feature", triage=True)
+        tid = kb.create_task(conn, title="ship a feature", triage=True, created_by="tester")
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -114,7 +114,7 @@ def test_decompose_fanout_children_inherit_root_assignee_when_unrouted(kanban_ho
     (an incognito profile with no credentials), so the old fallback spawned
     workers that deadlocked on capability blockers."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="zdr", triage=True, created_by="tester")
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -158,7 +158,7 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
     fills in when no explicit default is set (explicit config → card
     assignee → active profile)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True)
+        tid = kb.create_task(conn, title="ship it", assignee="engineer", triage=True, created_by="tester")
 
     llm_payload = jsonlib.dumps({
         "fanout": True,
@@ -192,7 +192,7 @@ def test_decompose_explicit_default_assignee_wins_over_root_assignee(kanban_home
 
 def test_decompose_fanout_false_invalid_llm_assignee_uses_default(kanban_home):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="route me safely", triage=True)
+        tid = kb.create_task(conn, title="route me safely", triage=True, created_by="tester")
 
     llm_payload = jsonlib.dumps({
         "fanout": False,
@@ -237,7 +237,7 @@ def test_load_routing_falls_back_to_defaults_when_config_unreadable(kanban_home,
 
 def test_decompose_returns_false_when_task_not_triage(kanban_home):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="x")  # ready, not triage
+        tid = kb.create_task(conn, title="x", created_by="tester")  # ready, not triage
 
     patches = _patch_list_profiles(["orchestrator"])
     for p in patches:

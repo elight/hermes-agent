@@ -49,7 +49,7 @@ def test_worker_for_served_profile_gets_its_own_env_and_toolset_pin(served, monk
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alpha")
+        tid = kb.create_task(conn, title="t", assignee="alpha", created_by="tester")
         task = kb.get_task(conn, tid)
     finally:
         conn.close()
@@ -91,7 +91,7 @@ def test_notifier_pings_run_under_the_subscribers_profile(served, monkeypatch):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="notify parity", assignee="alpha")
+        tid = kb.create_task(conn, title="notify parity", assignee="alpha", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="1001", notifier_profile="alpha")
         kb.complete_task(conn, tid, summary="done")
     finally:

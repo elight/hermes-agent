@@ -65,7 +65,7 @@ def _orphan_running(conn, tid, *, claim_lock=None, claim_expires=None,
 class TestReconcileOrphanedRunning:
     def test_null_claim_lock_orphan_requeued(self, conn):
         """running + claim_lock NULL → requeued to ready with a note."""
-        tid = kb.create_task(conn, title="zombie", assignee="w")
+        tid = kb.create_task(conn, title="zombie", assignee="w", created_by="tester")
         _orphan_running(conn, tid)
 
         reconciled = kbd.reconcile_orphaned_running(conn)
@@ -84,7 +84,7 @@ class TestReconcileOrphanedRunning:
         """running + claim_lock set but claim_expires NULL is also invisible
         to release_stale_claims — reconciliation must catch it."""
         host = kb._claimer_id().split(":", 1)[0]
-        tid = kb.create_task(conn, title="half-claim", assignee="w")
+        tid = kb.create_task(conn, title="half-claim", assignee="w", created_by="tester")
         _orphan_running(conn, tid, claim_lock=f"{host}:dead")
 
         reconciled = kbd.reconcile_orphaned_running(conn)
@@ -95,7 +95,7 @@ class TestReconcileOrphanedRunning:
         ).fetchone()["status"] == "ready"
 
     def test_reconciled_event_and_note_logged(self, conn):
-        tid = kb.create_task(conn, title="zombie", assignee="w")
+        tid = kb.create_task(conn, title="zombie", assignee="w", created_by="tester")
         _orphan_running(conn, tid)
 
         kbd.reconcile_orphaned_running(conn)
@@ -109,7 +109,7 @@ class TestReconcileOrphanedRunning:
 
     def test_healthy_running_task_untouched(self, conn):
         """A properly claimed running task is NOT an orphan."""
-        tid = kb.create_task(conn, title="healthy", assignee="w")
+        tid = kb.create_task(conn, title="healthy", assignee="w", created_by="tester")
         kb.claim_task(conn, tid)
 
         assert kbd.reconcile_orphaned_running(conn) == []
@@ -120,7 +120,7 @@ class TestReconcileOrphanedRunning:
     def test_live_worker_pid_defers_reconcile(self, conn):
         """If the orphan row still records a live PID on this host, don't
         requeue beside a possibly-alive worker — defer to the next tick."""
-        tid = kb.create_task(conn, title="maybe-alive", assignee="w")
+        tid = kb.create_task(conn, title="maybe-alive", assignee="w", created_by="tester")
         sleeper = subprocess.Popen(["sleep", "30"])
         try:
             _orphan_running(conn, tid, worker_pid=sleeper.pid)
@@ -134,7 +134,7 @@ class TestReconcileOrphanedRunning:
 
     def test_dead_worker_pid_orphan_requeued(self, conn):
         """Orphan with a recorded but dead PID is reconciled."""
-        tid = kb.create_task(conn, title="dead-pid", assignee="w")
+        tid = kb.create_task(conn, title="dead-pid", assignee="w", created_by="tester")
         dead = subprocess.Popen(["true"])
         dead.wait()
         _orphan_running(conn, tid, worker_pid=dead.pid)
@@ -143,7 +143,7 @@ class TestReconcileOrphanedRunning:
 
     def test_non_running_statuses_ignored(self, conn):
         for status in ("todo", "ready", "blocked", "done"):
-            tid = kb.create_task(conn, title=f"s-{status}", assignee="w")
+            tid = kb.create_task(conn, title=f"s-{status}", assignee="w", created_by="tester")
             conn.execute(
                 "UPDATE tasks SET status=?, claim_lock=NULL, "
                 "claim_expires=NULL WHERE id=?", (status, tid),
@@ -154,7 +154,7 @@ class TestReconcileOrphanedRunning:
 
 class TestDispatchOnceReconciles:
     def test_dispatch_once_reconciles_orphans(self, conn):
-        tid = kb.create_task(conn, title="zombie", assignee="w")
+        tid = kb.create_task(conn, title="zombie", assignee="w", created_by="tester")
         _orphan_running(conn, tid)
 
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
@@ -168,7 +168,7 @@ class TestDispatchOnceReconciles:
     def test_dispatch_once_reconcile_can_be_disabled(self, conn):
         """kanban.reconcile_orphans=false plumbs through as
         reconcile_orphans=False and skips the pass."""
-        tid = kb.create_task(conn, title="zombie", assignee="w")
+        tid = kb.create_task(conn, title="zombie", assignee="w", created_by="tester")
         _orphan_running(conn, tid)
 
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),

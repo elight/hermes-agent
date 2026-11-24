@@ -45,7 +45,7 @@ def conn(kanban_home):
 def test_held_lock_skips_the_tick_without_writes(conn):
     """While another holder owns the board lock, dispatch_once must skip and
     must NOT invoke spawn_fn (no DB writes happen on a skipped tick)."""
-    kb.create_task(conn, title="t", assignee="w")
+    kb.create_task(conn, title="t", assignee="w", created_by="tester")
     db_path = kb.kanban_db_path(board="default")
 
     spawn_calls: list = []

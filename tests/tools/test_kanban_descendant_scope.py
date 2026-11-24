@@ -18,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[2]
 def _worker_board(tmp_path, monkeypatch):
     db = tmp_path / "assigned.db"
     conn = connect(db)
-    own, foreign = [kb.create_task(conn, title=title) for title in ("own", "foreign")]
+    own, foreign = [kb.create_task(conn, title=title, created_by="tester") for title in ("own", "foreign")]
     for tid in (own, foreign):
         kb.claim_task(conn, tid)
     task = kb.get_task(conn, own)
@@ -153,12 +153,12 @@ def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path,
         "from hermes_cli.kanban_db_connect import connect\n"
         "out = {'marker': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT')}\n"
         "try:\n"
-        "    conn = connect(kb.kanban_db_path()); kb.create_task(conn, title='lineage'); out['lineage'] = 'WROTE'\n"
+        "    conn = connect(kb.kanban_db_path()); kb.create_task(conn, title='lineage', created_by='tester'); out['lineage'] = 'WROTE'\n"
         "except PermissionError as exc:\n"
         "    out['lineage'] = 'fenced: ' + str(exc)\n"
         f"os.environ['HERMES_HOME'] = {str(scratch_home)!r}\n"
         "import hermes_constants; hermes_constants._default_hermes_root_memo = None\n"
-        "conn = connect(kb.kanban_db_path()); out['scratch'] = kb.create_task(conn, title='scratch')\n"
+        "conn = connect(kb.kanban_db_path()); out['scratch'] = kb.create_task(conn, title='scratch', created_by='tester')\n"
         "print('SCOPE_RESULT=' + json.dumps(out))\n"
     )
     with delegated_child_context("child-repro"):

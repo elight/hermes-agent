@@ -26,7 +26,7 @@ def task(tmp_path, monkeypatch):
         monkeypatch.delenv(f"HERMES_SESSION_{name}", raising=False)
     kb.init_db()
     with kbc.connect() as conn:
-        return kb.create_task(conn, title="dm topic card", assignee="worker")
+        return kb.create_task(conn, title="dm topic card", assignee="worker", created_by="tester")
 
 
 def _subscribe(*argv):
@@ -63,7 +63,7 @@ def test_a_dm_with_nothing_to_infer_warns_and_an_explicit_thread_is_kept(task, c
     assert "DM root" in capsys.readouterr().err
     assert _threads(task) == [""]
     with kbc.connect() as conn:
-        other = kb.create_task(conn, title="explicit", assignee="worker")
+        other = kb.create_task(conn, title="explicit", assignee="worker", created_by="tester")
     _subscribe(other, "--platform", "telegram", "--chat-id", DM, "--thread-id", "7")
     assert _threads(other) == ["7"]
     assert "warning" not in capsys.readouterr().err

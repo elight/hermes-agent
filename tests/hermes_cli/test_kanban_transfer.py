@@ -65,11 +65,13 @@ def _seed_board(slug: str = "alpha") -> dict[str, str]:
     ids = {}
     with kbc.connect_closing(board=slug) as conn:
         ids["scratch"] = kb.create_task(
-            conn, title="scratch task", body="body", assignee="coder"
+            conn, title="scratch task", body="body", assignee="coder",
+            created_by="tester",
         )
         ids["worktree"] = kb.create_task(
             conn, title="worktree task", assignee="coder",
             workspace_kind="worktree", workspace_path="/exporter/repo",
+            created_by="tester",
         )
         kb.add_comment(conn, ids["scratch"], "brooklyn", "a comment")
         kb.link_tasks(conn, ids["scratch"], ids["worktree"])
@@ -276,12 +278,12 @@ def test_slug_collision_creates_a_new_board(kanban_root, tmp_path):
 
 def test_import_never_targets_the_default_board(kanban_root, tmp_path):
     with kbc.connect_closing(board="default") as conn:
-        kb.create_task(conn, title="exported default task")
+        kb.create_task(conn, title="exported default task", created_by="tester")
     archive = kt.export_board("default", str(tmp_path / "default"))["archive"]
 
     kanban_root("target")
     with kbc.connect_closing(board="default") as conn:
-        kb.create_task(conn, title="local default task")
+        kb.create_task(conn, title="local default task", created_by="tester")
 
     result = kt.import_board(archive)
 

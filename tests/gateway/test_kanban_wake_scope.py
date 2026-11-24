@@ -85,6 +85,7 @@ def _completed_subscription(**sub_kwargs):
             title="wake scope",
             assignee="worker",
             session_id="origin-session",
+            created_by="tester",
         )
         # Push-adapter wake injection is gated on the subscription's
         # delivery_mode ("notify+wake"/"wake") on current main; the plain

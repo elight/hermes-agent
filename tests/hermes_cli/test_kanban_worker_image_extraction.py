@@ -55,6 +55,7 @@ def _add_task_with_body(body: str, *, title: str = "Look at this") -> str:
             body=body,
             assignee="worker-a",
             tenant=None,
+            created_by="tester",
         )
     finally:
         conn.close()

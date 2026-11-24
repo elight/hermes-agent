@@ -29,7 +29,7 @@ def _make_project(name="Web App", repo="/tmp/webapp"):
 
 def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn):
     proj = _make_project()
-    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
+    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug, created_by="tester")
     task = kb.get_task(kanban_conn, tid)
 
     assert task.project_id == proj.id
@@ -49,13 +49,14 @@ def test_explicit_branch_overrides_project_default(kanban_conn):
         project_id=proj.slug,
         workspace_kind="worktree",
         branch_name="feature/custom",
+        created_by="tester",
     )
     task = kb.get_task(kanban_conn, tid)
     assert task.branch_name == "feature/custom"
 
 
 def test_unlinked_task_unchanged(kanban_conn):
-    tid = kb.create_task(kanban_conn, title="plain")
+    tid = kb.create_task(kanban_conn, title="plain", created_by="tester")
     task = kb.get_task(kanban_conn, tid)
 
     assert task.project_id is None

@@ -73,7 +73,7 @@ def client(kanban_home):
 
 
 def test_set_and_clear_model_override(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", created_by="tester")
     assert kb.set_model_override(conn, tid, "gpt-5.6-sol", provider="openai")
     t = kb.get_task(conn, tid)
     assert t.model_override == "gpt-5.6-sol"
@@ -87,12 +87,13 @@ def test_set_and_clear_model_override(conn):
 
 
 def test_provider_without_model_rejected(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker")
+    tid = kb.create_task(conn, title="t", assignee="worker", created_by="tester")
     with pytest.raises(ValueError):
         kb.set_model_override(conn, tid, None, provider="openrouter")
     with pytest.raises(ValueError):
         kb.create_task(
             conn, title="t2", assignee="worker", provider_override="openrouter",
+            created_by="tester",
         )
 
 
@@ -100,6 +101,7 @@ def test_create_task_with_model_and_provider(conn):
     tid = kb.create_task(
         conn, title="t", assignee="worker",
         model_override="qwen-max", provider_override="openrouter",
+        created_by="tester",
     )
     t = kb.get_task(conn, tid)
     assert t.model_override == "qwen-max"
@@ -143,7 +145,7 @@ def test_spawn_resolves_claimed_task_policy(
     workspace = tmp_path / "ws"
     workspace.mkdir()
     tid = kb.create_task(conn, title="t", assignee="elias",
-                         workspace_kind="dir", workspace_path=str(workspace), **overrides)
+                         workspace_kind="dir", workspace_path=str(workspace), **overrides, created_by="tester")
     task = kb.claim_task(conn, tid)
     assert task is not None
     captured = {}
@@ -259,7 +261,7 @@ def test_model_options_endpoint_shape(client, monkeypatch):
 
 
 def test_reasoning_effort_normalizes_and_rejects(conn):
-    tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="  HIGH ")
+    tid = kb.create_task(conn, title="t", assignee="worker", reasoning_effort="  HIGH ", created_by="tester")
     assert kb.get_task(conn, tid).reasoning_effort == "high"
 
     # "none" is a VALUE (thinking off), not a clear.
@@ -281,6 +283,7 @@ def test_reasoning_effort_survives_clearing_the_model(conn):
         conn, title="t", assignee="worker",
         model_override="glm-5", provider_override="openrouter",
         reasoning_effort="ultra",
+        created_by="tester",
     )
     assert kb.set_model_override(conn, tid, None)
     t = kb.get_task(conn, tid)

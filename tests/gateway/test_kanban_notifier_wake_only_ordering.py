@@ -72,6 +72,7 @@ def _make_completed_task(delivery_mode):
             title="wake ordering task",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,

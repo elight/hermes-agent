@@ -13,9 +13,9 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     with kbc.connect_closing() as conn:
-        prerequisite = kb.create_task(conn, title="prerequisite", tenant="business-a")
-        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[prerequisite])
-        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a")
+        prerequisite = kb.create_task(conn, title="prerequisite", tenant="business-a", created_by="tester")
+        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[prerequisite], created_by="tester")
+        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a", created_by="tester")
         specs = [{"title": "work", "assignee": "default"}]
         first = decompose_triage_task(conn, root, root_assignee="default", children=specs)
         assert first and kb.get_task(conn, first[0]).tenant == "business-a"
@@ -42,14 +42,14 @@ def test_parent_tenant_is_inherited_at_creation_boundary(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from tools.kanban_tools import _handle_create
     with kbc.connect_closing() as conn:
-        unscoped = kb.create_task(conn, title="unscoped")
-        parent = kb.create_task(conn, title="parent", tenant="business-a")
+        unscoped = kb.create_task(conn, title="unscoped", created_by="tester")
+        parent = kb.create_task(conn, title="parent", tenant="business-a", created_by="tester")
         for explicit, expected in [(None, "business-a"), ("business-b", "business-b")]:
-            child = kb.create_task(conn, title="child", parents=[unscoped, parent], tenant=explicit)
+            child = kb.create_task(conn, title="child", parents=[unscoped, parent], tenant=explicit, created_by="tester")
             assert kb.get_task(conn, child).tenant == expected
         result = json.loads(_handle_create({"title": "tool child", "assignee": "default", "parents": [parent]}))
         assert result["ok"]
         assert kb.get_task(conn, result["task_id"]).tenant == "business-a"
         with pytest.raises(ValueError, match="unknown parent"):
-            kb.create_task(conn, title="invalid", parents=["missing"])
+            kb.create_task(conn, title="invalid", parents=["missing"], created_by="tester")
         assert kb.get_task(conn, unscoped).tenant is None

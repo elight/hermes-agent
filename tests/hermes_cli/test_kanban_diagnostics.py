@@ -137,7 +137,7 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
     """
     conn = kbc.connect()
     try:
-        parent = kb.create_task(conn, title="p", assignee="w")
+        parent = kb.create_task(conn, title="p", assignee="w", created_by="tester")
         real = kb.create_task(conn, title="r", assignee="x", created_by="w")
         with pytest.raises(kb.HallucinatedCardsError):
             kb.complete_task(

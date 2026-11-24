@@ -37,7 +37,7 @@ def test_slash_subscription_keeps_the_routed_source_owner(tmp_path, monkeypatch)
     source = SessionSource(platform=Platform.DISCORD, chat_id="post", chat_type="thread",
                            thread_id="post", scope_id="guild", parent_chat_id="parent", profile="yuki")
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="slash-created")
+        task = kb.create_task(conn, title="slash-created", created_by="tester")
     assert asyncio.run(runner._kanban_auto_subscribe(MessageEvent(text="/kanban create", source=source), task, None))
     with kbc.connect() as conn:
         sub = kbn.list_notify_subs(conn, task)[0]

@@ -288,19 +288,21 @@ def test_reopening_parent_demotes_ready_child(client):
 
 def test_reopening_parent_retracts_review_and_blocks_approval(client):
     with kbc.connect() as conn:
-        parent_id = kb.create_task(conn, title="parent", assignee="planner")
+        parent_id = kb.create_task(conn, title="parent", assignee="planner", created_by="tester")
         assert kb.complete_task(conn, parent_id, result="done")
         child_id = kb.create_task(
             conn,
             title="child in review",
             assignee="reviewer",
             parents=[parent_id],
+            created_by="tester",
         )
         grandchild_id = kb.create_task(
             conn,
             title="downstream",
             assignee="writer",
             parents=[child_id],
+            created_by="tester",
         )
         implementation = kb.claim_task(conn, child_id)
         assert implementation is not None
@@ -356,13 +358,14 @@ def test_reopening_parent_retracts_review_and_blocks_approval(client):
 
 def test_reopening_parent_recursively_retracts_done_and_running_descendants(client):
     with kbc.connect() as conn:
-        parent_id = kb.create_task(conn, title="root", assignee="planner")
+        parent_id = kb.create_task(conn, title="root", assignee="planner", created_by="tester")
         assert kb.complete_task(conn, parent_id, result="done")
         child_id = kb.create_task(
             conn,
             title="accepted child",
             assignee="builder",
             parents=[parent_id],
+            created_by="tester",
         )
         assert kb.complete_task(conn, child_id, result="done")
         grandchild_id = kb.create_task(
@@ -370,6 +373,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
             title="running grandchild",
             assignee="writer",
             parents=[child_id],
+            created_by="tester",
         )
         grandchild_run = kb.claim_task(conn, grandchild_id)
         assert grandchild_run is not None
@@ -404,7 +408,7 @@ def test_reopening_parent_recursively_retracts_done_and_running_descendants(clie
 
 def test_dashboard_reclaim_of_active_review_preserves_review_phase(client):
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="active review", assignee="reviewer")
+        task_id = kb.create_task(conn, title="active review", assignee="reviewer", created_by="tester")
         implementation = kb.claim_task(conn, task_id)
         assert implementation is not None
         assert kb.request_review(
@@ -931,7 +935,7 @@ def test_reclaim_endpoint_releases_running_claim(client):
     import secrets
     conn = kbc.connect()
     try:
-        t = kb.create_task(conn, title="running", assignee="x")
+        t = kb.create_task(conn, title="running", assignee="x", created_by="tester")
         lock = secrets.token_hex(8)
         future = int(time.time()) + 3600
         conn.execute(
@@ -974,7 +978,7 @@ def test_reassign_endpoint_switches_profile(client):
     """POST /tasks/<id>/reassign changes the assignee field."""
     conn = kbc.connect()
     try:
-        t = kb.create_task(conn, title="task", assignee="orig")
+        t = kb.create_task(conn, title="task", assignee="orig", created_by="tester")
     finally:
         conn.close()
 
@@ -1001,7 +1005,7 @@ def test_reassign_endpoint_switches_profile(client):
 def test_diagnostics_endpoint_surfaces_blocked_hallucination(client):
     conn = kbc.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="alice")
+        parent = kb.create_task(conn, title="parent", assignee="alice", created_by="tester")
         real = kb.create_task(conn, title="real", assignee="x", created_by="alice")
         import pytest as _pytest
         with _pytest.raises(kb.HallucinatedCardsError):
@@ -1173,7 +1177,7 @@ def test_board_card_exposes_current_run_start(client):
     retry_start = now - 90  # retry run started 90s ago
     conn = kbc.connect()
     try:
-        t = kb.create_task(conn, title="retried", assignee="x")
+        t = kb.create_task(conn, title="retried", assignee="x", created_by="tester")
         lock = "lock-runclock"
         future = now + 3600
         conn.execute(
@@ -1189,7 +1193,7 @@ def test_board_card_exposes_current_run_start(client):
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
         # A sibling task with no run at all: key present, null.
-        u = kb.create_task(conn, title="unclaimed", assignee="x")
+        u = kb.create_task(conn, title="unclaimed", assignee="x", created_by="tester")
         conn.commit()
     finally:
         conn.close()

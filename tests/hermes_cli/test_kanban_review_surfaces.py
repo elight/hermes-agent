@@ -26,7 +26,7 @@ def review_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> str:
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="Review tool contract", assignee="builder")
+        task_id = kb.create_task(conn, title="Review tool contract", assignee="builder", created_by="tester")
         task = kb.claim_task(conn, task_id, claimer="builder:1")
         assert task is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -129,7 +129,7 @@ def test_review_cli_round_trip_preserves_handoff(
     kb.init_db()
 
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="CLI review", assignee="builder")
+        task_id = kb.create_task(conn, title="CLI review", assignee="builder", created_by="tester")
         implementation = kb.claim_task(conn, task_id, claimer="builder:1")
         assert implementation is not None
     monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
@@ -173,7 +173,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
     secret = "ghp_" + "R" * 40
 
     with kbc.connect() as conn:
-        direct_id = kb.create_task(conn, title="direct redaction", assignee="builder")
+        direct_id = kb.create_task(conn, title="direct redaction", assignee="builder", created_by="tester")
         direct_run = kb.claim_task(conn, direct_id)
         assert direct_run is not None
         assert kb.request_review(
@@ -210,7 +210,7 @@ def test_domain_and_cli_review_handoffs_redact_before_persistence(
         assert secret not in str(run.summary)
         assert secret not in json.dumps(event.payload)
 
-        cli_id = kb.create_task(conn, title="CLI redaction", assignee="builder")
+        cli_id = kb.create_task(conn, title="CLI redaction", assignee="builder", created_by="tester")
     cli_output = kc.run_slash(
         f'request-review {cli_id} --summary "cli {secret}" '
         f"--metadata '{{\"token\":\"{secret}\"}}'"
@@ -240,8 +240,8 @@ def test_cli_reopen_review_is_transition_first_and_redacts_reason(
     monkeypatch.setenv("HERMES_HOME", str(home))
     secret = "ghp_" + "Q" * 40
     with kbc.connect() as conn:
-        invalid_id = kb.create_task(conn, title="not review", assignee="builder")
-        review_id = kb.create_task(conn, title="review", assignee="builder")
+        invalid_id = kb.create_task(conn, title="not review", assignee="builder", created_by="tester")
+        review_id = kb.create_task(conn, title="review", assignee="builder", created_by="tester")
         assert kb.request_review(conn, review_id, summary="ready")
 
     invalid_output = kc.run_slash(
@@ -282,6 +282,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             title="Goal-mode tool task",
             assignee="builder",
             goal_mode=True,
+            created_by="tester",
         )
         claimed = kb.claim_task(conn, tool_task, claimer="builder:1")
         assert claimed is not None
@@ -317,6 +318,7 @@ def test_goal_mode_review_handoff_cannot_bypass_judge(
             title="Goal-mode CLI task",
             assignee="builder",
             goal_mode=True,
+            created_by="tester",
         )
         cli_claimed = kb.claim_task(conn, cli_task, claimer="builder:2")
         assert cli_claimed is not None
@@ -380,12 +382,13 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
     kb.init_db()
 
     with kbc.connect() as conn:
-        parent_id = kb.create_task(conn, title="Implementation", assignee="builder")
+        parent_id = kb.create_task(conn, title="Implementation", assignee="builder", created_by="tester")
         child_id = kb.create_task(
             conn,
             title="Review",
             assignee="reviewer",
             parents=[parent_id],
+            created_by="tester",
         )
         parent = kb.claim_task(conn, parent_id, claimer="builder:1")
         assert parent is not None

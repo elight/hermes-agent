@@ -46,7 +46,7 @@ async def test_completed_board_wake_is_admitted_without_changing_human_input(tmp
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
     kb.init_db()
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="wake receipt", assignee="worker")
+        tid = kb.create_task(conn, title="wake receipt", assignee="worker", created_by="tester")
         kb.complete_task(conn, tid, summary="completed result")
         task = kb.get_task(conn, tid)
     assert task is not None and task.status == "done"

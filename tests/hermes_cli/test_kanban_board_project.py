@@ -66,7 +66,7 @@ def test_create_task_inherits_board_project(fresh_home, tmp_path):
     kb.create_board("scoped", name="Scoped", project_id=proj_id)
     conn = kbc.connect(board="scoped")
     try:
-        tid = kb.create_task(conn, title="inherit me", board="scoped")
+        tid = kb.create_task(conn, title="inherit me", board="scoped", created_by="tester")
         assert kb.get_task(conn, tid).project_id == proj_id
     finally:
         conn.close()
@@ -82,7 +82,7 @@ def test_create_task_explicit_project_beats_board(fresh_home, tmp_path):
     kb.create_board("scoped2", name="Scoped2", project_id=board_proj)
     conn = kbc.connect(board="scoped2")
     try:
-        tid = kb.create_task(conn, title="explicit", board="scoped2", project_id=task_proj)
+        tid = kb.create_task(conn, title="explicit", board="scoped2", project_id=task_proj, created_by="tester")
         assert kb.get_task(conn, tid).project_id == task_proj
     finally:
         conn.close()
@@ -101,9 +101,9 @@ def test_create_task_explicit_scratch_beats_board(fresh_home, tmp_path):
     conn = kbc.connect(board="scoped3")
     try:
         scratch = kb.get_task(conn, kb.create_task(
-            conn, title="explicit scratch", board="scoped3", workspace_kind="scratch"))
+            conn, title="explicit scratch", board="scoped3", workspace_kind="scratch", created_by="tester"))
         assert (scratch.workspace_kind, scratch.project_id) == ("scratch", None)
-        default = kb.get_task(conn, kb.create_task(conn, title="default", board="scoped3"))
+        default = kb.get_task(conn, kb.create_task(conn, title="default", board="scoped3", created_by="tester"))
         assert (default.workspace_kind, default.project_id) == ("worktree", proj_id)
     finally:
         conn.close()

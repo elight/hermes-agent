@@ -16,7 +16,7 @@ def _bound_claim(tmp_path, monkeypatch):
     kb.init_db()
     path = kb.kanban_db_path()
     with connect_closing(path) as conn:
-        task_id = kb.create_task(conn, title="private fixture", assignee="default")
+        task_id = kb.create_task(conn, title="private fixture", assignee="default", created_by="tester")
         task = kb.claim_task(conn, task_id, claimer="private-host:owner")
         assert task is not None
         context = {"db": str(path), "task_id": task_id,

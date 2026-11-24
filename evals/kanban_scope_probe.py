@@ -24,7 +24,7 @@ hh.mkdir(exist_ok=True)
 (hh / "config.yaml").write_text("toolsets: [kanban]\n")
 db = home / "assigned.db"
 conn = connect(db)
-own, foreign = [kb.create_task(conn, title=x) for x in ("owner", "foreign")]
+own, foreign = [kb.create_task(conn, title=x, created_by="eval") for x in ("owner", "foreign")]
 for t in (own, foreign):
     kb.claim_task(conn, t)
 task = kb.get_task(conn, own)

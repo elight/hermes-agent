@@ -197,7 +197,7 @@ class TestBoardCRUD:
         # on Windows an open connection locks kanban.db so remove_board's
         # rename below fails with WinError 5/32.
         with kbc.connect_closing(board="recycle") as conn:
-            kb.create_task(conn, title="t1", assignee="dev")
+            kb.create_task(conn, title="t1", assignee="dev", created_by="tester")
         db_path = kb.board_dir("recycle") / "kanban.db"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
 
@@ -231,11 +231,11 @@ class TestConnectionIsolation:
         kb.create_board("beta")
 
         with kbc.connect(board="alpha") as conn:
-            kb.create_task(conn, title="alpha-task-1", assignee="dev")
-            kb.create_task(conn, title="alpha-task-2", assignee="dev")
+            kb.create_task(conn, title="alpha-task-1", assignee="dev", created_by="tester")
+            kb.create_task(conn, title="alpha-task-2", assignee="dev", created_by="tester")
 
         with kbc.connect(board="beta") as conn:
-            kb.create_task(conn, title="beta-only", assignee="dev")
+            kb.create_task(conn, title="beta-only", assignee="dev", created_by="tester")
 
         with kbc.connect(board="alpha") as conn:
             a = kb.list_tasks(conn)
@@ -252,7 +252,7 @@ class TestConnectionIsolation:
         kb.create_board("curr")
         kb.set_current_board("curr")
         with kbc.connect() as conn:
-            kb.create_task(conn, title="implicit", assignee="x")
+            kb.create_task(conn, title="implicit", assignee="x", created_by="tester")
         with kbc.connect(board="curr") as conn:
             tasks = kb.list_tasks(conn)
         assert [t.title for t in tasks] == ["implicit"]
@@ -263,7 +263,7 @@ class TestConnectionIsolation:
         kb.set_current_board("persist")
         monkeypatch.setenv("HERMES_KANBAN_BOARD", "envwin")
         with kbc.connect() as conn:
-            kb.create_task(conn, title="via-env", assignee="x")
+            kb.create_task(conn, title="via-env", assignee="x", created_by="tester")
         with kbc.connect(board="envwin") as conn:
             assert [t.title for t in kb.list_tasks(conn)] == ["via-env"]
         with kbc.connect(board="persist") as conn:

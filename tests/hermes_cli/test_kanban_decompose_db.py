@@ -31,6 +31,7 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         assignee=assignee,
         tenant=tenant,
         triage=True,
+        created_by="tester",
     )
 
 

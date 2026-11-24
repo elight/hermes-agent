@@ -24,10 +24,10 @@ def worker_board(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        worker_tid = kb.create_task(conn, title="worker card", assignee="test-worker")
+        worker_tid = kb.create_task(conn, title="worker card", assignee="test-worker", created_by="tester")
         kb.claim_task(conn, worker_tid)
         run_id = kb._current_run_id(conn, worker_tid)
-        other_tid = kb.create_task(conn, title="other card")
+        other_tid = kb.create_task(conn, title="other card", created_by="tester")
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", worker_tid)

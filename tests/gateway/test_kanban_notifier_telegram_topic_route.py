@@ -52,7 +52,7 @@ def _runner(tmp_path, monkeypatch, routes):
 def _topic_subscription(owner):
     """What ``kanban_create`` auto-subscribe stores from a Telegram forum topic."""
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="topic card", assignee="worker")
+        task = kb.create_task(conn, title="topic card", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=task, platform="telegram", chat_id=GROUP_A, thread_id=TOPIC,
                            chat_type="group", user_id="111", notifier_profile=owner,
                            delivery_mode="notify", delivery_metadata={"chat_type": "group", "thread_id": TOPIC})

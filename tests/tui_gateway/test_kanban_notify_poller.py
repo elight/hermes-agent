@@ -32,7 +32,7 @@ def _session(key: str = SESSION_KEY) -> dict:
 def _create_subscribed_task(*, chat_id: str = SESSION_KEY, platform: str = "tui"):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="notify tui", assignee="worker")
+        tid = kb.create_task(conn, title="notify tui", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
         return tid
     finally:

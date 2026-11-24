@@ -134,7 +134,7 @@ def test_a_kanban_custom_provider_override_stays_on_the_profiles_endpoint(tmp_pa
     kb.create_board('owned')
     with closing(connect(board='owned')) as conn:
         task_id = kb.create_task(conn, title='t', assignee='default', workspace_kind='dir',
-                                 workspace_path=str(tmp_path), model_override='qwen3-32b', provider_override='custom')
+                                 workspace_path=str(tmp_path), model_override='qwen3-32b', provider_override='custom', created_by="tester")
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), native_owner=True,

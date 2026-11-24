@@ -29,10 +29,10 @@ def running_child_with_parent(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        parent_id = kb.create_task(conn, title="parent gate", assignee="op")
+        parent_id = kb.create_task(conn, title="parent gate", assignee="op", created_by="tester")
         assert kb.complete_task(conn, parent_id, result="parent shipped")
         child_id = kb.create_task(
-            conn, title="child work", assignee="test-worker", parents=[parent_id])
+            conn, title="child work", assignee="test-worker", parents=[parent_id], created_by="tester")
         assert kb.claim_task(conn, child_id) is not None
         run_id = kb._current_run_id(conn, child_id)
         # Parent reopens mid-run: the #113373 timeline.

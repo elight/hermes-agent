@@ -27,7 +27,7 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="group card", assignee="worker")
+        task = kb.create_task(conn, title="group card", assignee="worker", created_by="tester")
     # What the terminal tool hands the CLI child of a group-chat turn (tools/environments/local.py).
     for name, value in (("PLATFORM", "telegram"), ("CHAT_ID", GROUP), ("CHAT_TYPE", "group"),
                         ("USER_ID", "111")):
@@ -58,7 +58,7 @@ def test_another_topic_of_the_callers_group_is_left_alone(kanban_home, monkeypat
     _subscribe(kanban_home, "--platform", "telegram", "--chat-id", GROUP, "--thread-id", "88")
     assert _row(kanban_home)["user_id"] is None
     with kbc.connect() as conn:
-        same = kb.create_task(conn, title="same topic", assignee="worker")
+        same = kb.create_task(conn, title="same topic", assignee="worker", created_by="tester")
     _subscribe(same, "--platform", "telegram", "--chat-id", GROUP, "--thread-id", "77")
     assert _row(same)["user_id"] == "111"
 
@@ -67,7 +67,7 @@ def test_another_chat_and_an_explicit_id_are_left_alone(kanban_home):
     _subscribe(kanban_home, "--platform", "telegram", "--chat-id", "-100999", "--chat-type", "group")
     assert _row(kanban_home)["user_id"] is None
     with kbc.connect() as conn:
-        other = kb.create_task(conn, title="explicit", assignee="worker")
+        other = kb.create_task(conn, title="explicit", assignee="worker", created_by="tester")
     _subscribe(other, "--platform", "telegram", "--chat-id", GROUP, "--user-id", "222")
     assert _row(other)["user_id"] == "222"
 

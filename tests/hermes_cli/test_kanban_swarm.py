@@ -141,7 +141,7 @@ def test_plain_write_txn_nesting_raises_and_allow_nested_composes(tmp_path):
     try:
         workspace = tmp_path / "scratch-ws"
         workspace.mkdir()
-        tid = kb.create_task(conn, title="ws task", assignee="worker")
+        tid = kb.create_task(conn, title="ws task", assignee="worker", created_by="tester")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET workspace_path = ? WHERE id = ?",

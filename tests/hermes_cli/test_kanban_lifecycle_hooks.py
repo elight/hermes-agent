@@ -53,7 +53,7 @@ def captured_hooks(monkeypatch):
 def test_claim_fires_hook(kanban_home, captured_hooks):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="worker")
+        tid = kb.create_task(conn, title="t", assignee="worker", created_by="tester")
         claimed = kb.claim_task(conn, tid)
         assert claimed is not None
     finally:
@@ -99,8 +99,8 @@ def test_block_hook_runs_after_commit_with_write_lock_free(
     get_plugin_manager()._hooks["kanban_task_blocked"].append(_probe)
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="child", assignee="worker")
-        kb.link_tasks(conn, parent_id=kb.create_task(conn, title="parent"), child_id=tid)
+        tid = kb.create_task(conn, title="child", assignee="worker", created_by="tester")
+        kb.link_tasks(conn, parent_id=kb.create_task(conn, title="parent", created_by="tester"), child_id=tid)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (tid,))
         assert kb.block_task(conn, tid, reason="waiting", kind=kind)
@@ -121,7 +121,7 @@ def test_misbehaving_hook_does_not_break_transition(kanban_home, monkeypatch):
     try:
         conn = kbc.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="worker")
+            tid = kb.create_task(conn, title="t", assignee="worker", created_by="tester")
             kb.claim_task(conn, tid)
             # Despite the raising hook, completion succeeds and persists.
             assert kb.complete_task(conn, tid, summary="ok") is True

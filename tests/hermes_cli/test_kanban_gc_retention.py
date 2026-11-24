@@ -19,7 +19,7 @@ def board(tmp_path, monkeypatch):
     return tmp_path
 
 def _done_task_with_old_event(conn):
-    tid = kb.create_task(conn, title="finished")
+    tid = kb.create_task(conn, title="finished", created_by="tester")
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
         conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (tid,))
@@ -56,7 +56,7 @@ def test_gc_worker_logs_rejects_negative_window(board):
     assert log.exists()
 
 def _archived_scratch_workspace(conn) -> Path:
-    tid = kb.create_task(conn, title="archived with workspace")
+    tid = kb.create_task(conn, title="archived with workspace", created_by="tester")
     with kb.write_txn(conn):
         conn.execute(
             "UPDATE tasks SET status='archived', workspace_kind='scratch' WHERE id=?",
@@ -121,7 +121,7 @@ def test_cmd_gc_never_removes_the_workspaces_root_itself(board):
     sibling.mkdir(parents=True)
     (sibling / "work.txt").write_text("another task's scratch", encoding="utf-8")
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="archived scratch")
+        tid = kb.create_task(conn, title="archived scratch", created_by="tester")
         with kb.write_txn(conn):
             conn.execute(
                 "UPDATE tasks SET status='archived', workspace_kind='scratch', "
@@ -133,8 +133,8 @@ def test_cmd_gc_never_removes_the_workspaces_root_itself(board):
 
 
 def _shared_scratch(conn) -> tuple[str, str, Path]:
-    archived = kb.create_task(conn, title="archived sharer")
-    live = kb.create_task(conn, title="live sharer")
+    archived = kb.create_task(conn, title="archived sharer", created_by="tester")
+    live = kb.create_task(conn, title="live sharer", created_by="tester")
     shared = kb.workspaces_root() / "shared-scratch"
     shared.mkdir(parents=True)
     (shared / "note.txt").write_text("still needed", encoding="utf-8")
@@ -185,9 +185,9 @@ def test_cleanup_workspace_keeps_scratch_when_other_boards_cannot_be_listed(boar
     shared.mkdir(parents=True)
     (shared / "note.txt").write_text("still needed", encoding="utf-8")
     with kbc.connect_closing() as conn:
-        archived = kb.create_task(conn, title="archived on default")
+        archived = kb.create_task(conn, title="archived on default", created_by="tester")
     with kbc.connect_closing(board="other") as other:
-        live = kb.create_task(other, title="live on other")
+        live = kb.create_task(other, title="live on other", created_by="tester")
     for board_slug, task_id, status in ((None, archived, "archived"), ("other", live, "ready")):
         with kbc.connect_closing(board=board_slug) as conn, kb.write_txn(conn):
             conn.execute(

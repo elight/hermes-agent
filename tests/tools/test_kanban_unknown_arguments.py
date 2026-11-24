@@ -18,7 +18,7 @@ def test_review_unknown_argument_rejects_before_handoff(tmp_path, monkeypatch):
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title='review payload', assignee='builder', workspace_kind='scratch')
+        tid = kb.create_task(conn, title='review payload', assignee='builder', workspace_kind='scratch', created_by="tester")
         assert kb.claim_task(conn, tid) is not None
         workspace = kb.workspaces_root() / tid
         workspace.mkdir(parents=True)

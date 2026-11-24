@@ -53,6 +53,7 @@ def _create_review_block(delivery_mode, *, reason="Tests need updates"):
             title="existing implementation card",
             assignee="implementer",
             session_id="agent:main:telegram:thread:chat-1:topic-7",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,

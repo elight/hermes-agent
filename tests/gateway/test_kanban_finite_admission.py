@@ -26,7 +26,7 @@ def test_kanban_submission_enters_single_query_approval_context(tmp_path, monkey
     kb.create_board('owned')
     with closing(connect(board='owned')) as conn:
         task_id = kb.create_task(conn, title='Headless work', assignee='default',
-                                workspace_kind='dir', workspace_path=str(workspace))
+                                workspace_kind='dir', workspace_path=str(workspace), created_by="tester")
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     config = {'model': {'default': 'loop-model', 'provider': 'custom'},
@@ -89,7 +89,7 @@ def kanban_owner(tmp_path, monkeypatch):
         kb.create_board('owned')
         with closing(connect(board='owned')) as conn:
             task_id = kb.create_task(conn, title='Headless work', assignee='default',
-                                    workspace_kind='dir', workspace_path=str(tmp_path))
+                                    workspace_kind='dir', workspace_path=str(tmp_path), created_by="tester")
             kb.recompute_ready(conn)
             task = kb.claim_task(conn, task_id)
         store, runner, authority, dashboard = _owner(tmp_path)

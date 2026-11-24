@@ -57,7 +57,7 @@ def test_fresh_process_sweep_books_the_logged_exit_code(kanban_home, rc, event, 
     (marker, streak, no unified-budget hit) and a 75 is a rate-limit requeue — not a bare
     ``pid N not alive`` crash that counts a failure."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="t", assignee="a")
+        tid = kb.create_task(conn, title="t", assignee="a", created_by="tester")
         _dead_worker_with_log(conn, tid, 70001, rc)
 
         kbd.detect_crashed_workers(conn)
@@ -88,7 +88,7 @@ def test_violation_budget_trip_holds_until_operator_unblock(kanban_home):
     must not promote the card back the same tick (``consecutive_failures`` is still below
     ``failure_limit``); ``unblock_task`` lifts the hold."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="loop", assignee="a")
+        tid = kb.create_task(conn, title="loop", assignee="a", created_by="tester")
         for i in range(kbd._PROTOCOL_VIOLATION_FAILURE_LIMIT):
             _dead_worker_with_log(conn, tid, 71000 + i, 0)
             kbd.detect_crashed_workers(conn)
@@ -108,7 +108,7 @@ def test_plain_budget_trip_still_auto_recovers(kanban_home):
     survive: raising the dispatcher ``failure_limit`` past the counter promotes the card, and
     ``assign_task`` to a fresh profile (counter reset by design) promotes it too."""
     with kbc.connect() as conn:
-        tids = [kb.create_task(conn, title=t, assignee="a") for t in ("raise-limit", "reassign")]
+        tids = [kb.create_task(conn, title=t, assignee="a", created_by="tester") for t in ("raise-limit", "reassign")]
         for tid in tids:
             for i in range(2):
                 kbd._record_task_failure(

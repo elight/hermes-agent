@@ -212,7 +212,7 @@ def test_worker_toolsets_come_from_the_assignee_profile_not_the_parent_config(tm
     kb.create_board("owned")  # explicit creation; connect() never creates a board (#43243)
     with closing(connect(board="owned")) as conn:
         task_id = kb.create_task(conn, title="t", body="b", assignee="elias",
-                                 workspace_kind="dir", workspace_path=str(workspace))
+                                 workspace_kind="dir", workspace_path=str(workspace), created_by="tester")
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     actor = SessionActor("owner", str(profile), frozenset({"session:create"}), "transport")

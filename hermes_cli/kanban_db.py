@@ -1191,6 +1191,7 @@ def create_task(
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
+    created_by = require_created_by(created_by, conn)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -1328,10 +1329,6 @@ def create_task(
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
-
-
-def _board_meta_for(board: Optional[str]) -> dict:
-    return read_board_metadata(board if board else get_current_board())
 
 
 def _project_branch_name(project_obj: Any, task_id: str, title: Optional[str]) -> Optional[str]:
@@ -4196,6 +4193,7 @@ def current_run_started_ats(conn: sqlite3.Connection, task_ids: Iterable[str]) -
 
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_boards import (
+    _board_meta_for,
     _default_board_display_name,
     _dir_holds_board,
     board_metadata_path,
@@ -4208,6 +4206,7 @@ from hermes_cli.kanban_db_boards import (
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
     init_db,
+    require_created_by,
     write_txn,
 )
 from hermes_cli.kanban_db_workspace import (
