@@ -78,31 +78,47 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
+    from hermes_cli.config import FailedConfigRead, load_config
     configured_profile_cap = None
     try:
-        from hermes_cli.config import load_config
         _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        # Raw on purpose: 0 is an operator's decision, and an absent key means unlimited.
-        configured_profile_cap = _kanban_cfg.get("max_in_progress_per_profile")
-        # Memory-derived default when unset — same fallback the gateway applies.
-        max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
-        )
-        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
-        cli_max = getattr(args, "max", None)
-        max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
-        )
-    except Exception as exc:  # health: allow BLE001 -- ANY config failure must refuse the pass; load_config raises yaml/os/decode errors
+    except Exception as exc:  # health: allow BLE001 -- the READ itself can fail in every shape; any of them must refuse the pass
         # "I could not read the config" is NOT "the operator configured nothing". This handler
         # used to null every cap and dispatch anyway, so a broken config unlocked exactly the
         # one-profile fan-out this command is meant to avoid. Refuse instead — the same shape
         # kanban.dispatch_profiles already documents for a failed config read (fail closed).
+        # Scoped to the read alone: everything below parses a dict already in hand, so a bug of
+        # ours surfaces as itself rather than as a phantom config error.
         _err(f"kanban dispatch: cannot read config ({exc}); refusing to dispatch with no "
              "caps resolved. Repair config.yaml, then run again.")
         return 1
+    # ``load_config`` does NOT raise on a broken file, so the ``except`` above guards almost
+    # nothing on its own: the failure this function exists to catch arrives as a perfectly
+    # ordinary dict — ``FailedConfigRead``, the documented fail-open fallback, which may even
+    # carry the operator's last good values inside it. Measured: with a last-known-good copy
+    # available the read still returns FailedConfigRead (cap 2 intact inside it), and with no
+    # copy it returns FailedConfigRead with defaults. A caller cannot tell those apart from
+    # outside, so both refuse: a pass that starts workers costing a full model context each
+    # does not run on a config the loader itself refuses to call readable.
+    if isinstance(_cfg, FailedConfigRead):
+        _err(f"kanban dispatch: cannot read config ({getattr(_cfg, 'read_error', 'unreadable')}); "
+             "refusing to dispatch with no caps resolved. Any last-known-good copy is still on "
+             "disk and in backups/config/. Repair config.yaml (or run `hermes config check`), "
+             "then run again.")
+        return 1
+    _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+    default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+    # Raw on purpose: 0 is an operator's decision, and an absent key means unlimited.
+    configured_profile_cap = _kanban_cfg.get("max_in_progress_per_profile")
+    # Memory-derived default when unset — same fallback the gateway applies.
+    max_in_progress = kbd.resolve_max_in_progress(
+        kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+    )
+    # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
+    cli_max = getattr(args, "max", None)
+    max_spawn = (
+        cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
+    )
     profile_cap, cap_source = kanban_dispatch_cap.resolve_profile_cap(configured_profile_cap)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(

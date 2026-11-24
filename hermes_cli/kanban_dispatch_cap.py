@@ -112,8 +112,16 @@ def _kanban_setting(key: str) -> Any:
     is for the paths that only need the value.
     """
     try:
-        from hermes_cli.config import load_config_readonly
-        kanban = (load_config_readonly() or {}).get("kanban") or {}
+        from hermes_cli.config import FailedConfigRead, load_config_readonly
+        raw = load_config_readonly() or {}
+        if isinstance(raw, FailedConfigRead):
+            # "Nothing configured" and "I could not read the file" must not be the same line in
+            # the log: this path keeps dispatching on a broken config on purpose, so a silent
+            # None here is how a cap goes missing without a trace.
+            logger.warning("kanban: config.yaml could not be read (unreadable, not unset); "
+                           "kanban.%s is being treated as unset for this pass", key)
+            return None
+        kanban = (raw.get("kanban") or {})
         return kanban.get(key)
     except Exception:  # health: allow BLE001 -- config-read boundary; any failure means "unset", logged below
         logger.warning("kanban: could not read kanban.%s from config; treating it as unset",

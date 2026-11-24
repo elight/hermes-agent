@@ -74,9 +74,10 @@ def capped_env(isolated_kanban_home, monkeypatch):
 def _dispatch_cli(monkeypatch, args=None):
     """Run the real ``hermes kanban dispatch`` verb.
 
-    Returns ``(exit_code, dispatch_once_kwargs, stdout)``. Stdout is captured here rather than
-    via ``capsys`` because the verb prints its own summary; kwargs stay empty if the verb
-    refused to dispatch at all, which is itself an assertion worth making.
+    Returns ``(exit_code, dispatch_once_kwargs, stdout + stderr)``. Both streams are captured
+    here rather than via ``capsys`` because the verb prints its summary to stdout and its
+    warnings/refusals to stderr; kwargs stay empty if the verb refused to dispatch at all,
+    which is itself an assertion worth making.
     """
     from hermes_cli import kanban_db_dispatch as kbd
 
@@ -93,10 +94,22 @@ def _dispatch_cli(monkeypatch, args=None):
     ns = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
     if args:
         vars(ns).update(args)
-    buf = io.StringIO()
-    with contextlib.redirect_stdout(buf):
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
         rc = kanban_ops._cmd_dispatch(ns)
-    return rc, captured, buf.getvalue()
+    return rc, captured, out.getvalue() + err.getvalue()
+
+
+BROKEN_YAML = "kanban:\n  max_in_progress_per_profile: 1\n  bad: [unclosed\n"
+
+
+def _write_raw_config(home, text):
+    """Write config.yaml the way an operator's editor would: raw bytes, no schema in between."""
+    from hermes_cli.config import get_config_path
+    path = get_config_path() if home is None else os.path.join(home, "config.yaml")
+    with open(path, "w") as fh:
+        fh.write(text)
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -185,24 +198,76 @@ def test_unset_key_stays_unlimited_on_every_path(isolated_kanban_home, monkeypat
 # A config that cannot be read stops the pass                                 #
 # --------------------------------------------------------------------------- #
 
-def test_unreadable_config_refuses_the_pass_instead_of_unlocking_it(isolated_kanban_home,
-                                                                  capped_env, monkeypatch):
-    """The whole config read sat in one ``except Exception`` that nulled every cap and
-    dispatched anyway. A broken config must not be able to mean "spawn the queue"."""
+def test_a_real_unparseable_config_stops_the_pass(isolated_kanban_home, capped_env, monkeypatch):
+    """A broken config.yaml on disk, no last-known-good copy, nothing mocked about config.
+
+    The whole point of this case: ``load_config()`` does NOT raise on bad YAML — it serves the
+    documented fail-open fallback (``FailedConfigRead``, defaults standing in), so a guard written
+    against an exception guards nothing. The operator here wrote
+    ``max_in_progress_per_profile: 1``; a pass that reads that file as "unset" and dispatches is
+    the fail-open this PR is meant to close.
+    """
     make_ready, spawned = capped_env
-
-    def boom():
-        raise RuntimeError("config.yaml is unparseable")
-
-    monkeypatch.setattr("hermes_cli.config.load_config", boom)
+    _write_raw_config(isolated_kanban_home, BROKEN_YAML)
     make_ready(5)
-    rc, captured, _out = _dispatch_cli(monkeypatch)
+    rc, captured, out = _dispatch_cli(monkeypatch)
     assert captured == {}, (
-        "dispatch_once ran with an unreadable config; the pass should refuse before it "
-        "opens the board"
+        "dispatch_once ran against an unparseable config.yaml: "
+        f"{captured.get('max_in_progress_per_profile')!r} — the loader serves a fail-open "
+        "fallback rather than raising, so an `except Exception` never sees this"
     )
-    assert spawned == [], f"a pass that could not read its config started {len(spawned)} workers"
-    assert rc != 0, "refusing to dispatch must be visible in the exit code, not just stderr"
+    assert spawned == [], f"a pass over an unreadable config started {len(spawned)} workers"
+    assert rc != 0, "refusing to dispatch must be visible in the exit code"
+    assert "cannot read config" in out.lower(), out
+
+
+def test_a_recovered_copy_still_stops_the_pass(isolated_kanban_home, capped_env, monkeypatch):
+    """Even a recoverable read refuses, because the caller cannot tell recovery from defaults.
+
+    Measured on this repo's loader: break the YAML after a good load and ``load_config()`` still
+    returns ``FailedConfigRead`` — with the operator's last good ``cap: 2`` sitting *inside* it.
+    Break it with no copy available and it returns ``FailedConfigRead`` with defaults. The two
+    arrive as the same type from outside, so "honour the recovered values but warn" cannot be
+    implemented without new plumbing in the loader, and dispatching on the defaults half of that
+    ambiguity is the fail-open. The refusal message names the recovery so the operator knows
+    their settings are still on disk.
+    """
+    from hermes_cli.config import load_config
+
+    make_ready, spawned = capped_env
+    _write_raw_config(isolated_kanban_home,
+                      "kanban:\n  max_in_progress_per_profile: 2\n")
+    load_config()  # a successful parse is what records the last-known-good copy
+    _write_raw_config(isolated_kanban_home, BROKEN_YAML)
+    make_ready(5)
+    rc, captured, out = _dispatch_cli(monkeypatch)
+    assert rc != 0, f"a read that failed must refuse the pass even when recoverable; rc={rc}"
+    assert captured == {}, "dispatch_once ran on a FailedConfigRead that carried recovered values"
+    assert spawned == [], f"started {len(spawned)} workers on a config that failed to read"
+    assert "last-known-good" in out.lower(), (
+        "the refusal should say the operator's settings are still recoverable, not just "
+        "that they are broken: " + out
+    )
+
+
+def test_the_cap_helper_says_unreadable_rather_than_unset(isolated_kanban_home, caplog):
+    """``run_daemon`` and the dashboard must not log 'unset' for a file that failed to read.
+
+    They are allowed to keep dispatching on a broken config (the daemon tick should not die
+    because config.yaml is unhappy), but 'nothing configured' and 'I could not read it' cannot
+    be the same line in the log, or the next incident is un-debuggable.
+    """
+    import logging
+
+    from hermes_cli import kanban_dispatch_cap
+
+    _write_raw_config(isolated_kanban_home, BROKEN_YAML)
+    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_dispatch_cap"):
+        assert kanban_dispatch_cap.configured_profile_cap() is None
+    assert any("could not read" in r.message.lower() or "unreadable" in r.message.lower()
+               for r in caplog.records), (
+        "a FailedConfigRead was reported as merely unset; the two must be distinguishable"
+    )
 
 
 # --------------------------------------------------------------------------- #
