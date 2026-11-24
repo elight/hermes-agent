@@ -365,7 +365,7 @@ def _kanban_worker_model(monkeypatch, tmp_path) -> str:
     workspace.mkdir()
     kb.create_board("trial")
     with closing(connect(board="trial")) as conn:
-        task_id = kb.create_task(conn, title="t", assignee="default", workspace_kind="dir", workspace_path=str(workspace))
+        task_id = kb.create_task(conn, title="t", assignee="default", workspace_kind="dir", workspace_path=str(workspace), created_by="tester")
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=home), native_owner=True,

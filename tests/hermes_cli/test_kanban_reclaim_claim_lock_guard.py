@@ -49,7 +49,7 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
     """A reset carrying an OLD worker's claim_lock must NOT clobber a task
     that has since been re-claimed by a new worker."""
     host = kb._claimer_id().split(":", 1)[0]
-    tid = kb.create_task(conn, title="desync", assignee="w")
+    tid = kb.create_task(conn, title="desync", assignee="w", created_by="tester")
 
     # Worker A claims, then dies.
     kb.claim_task(conn, tid, claimer=f"{host}:A")
@@ -96,7 +96,7 @@ def test_genuine_crash_still_reclaims(conn):
     """When the claim_lock still matches the dead worker, the crash reclaim
     fires normally — the guard must not break the legitimate path."""
     host = kb._claimer_id().split(":", 1)[0]
-    tid = kb.create_task(conn, title="legit", assignee="w")
+    tid = kb.create_task(conn, title="legit", assignee="w", created_by="tester")
     kb.claim_task(conn, tid, claimer=f"{host}:A")
     dead = subprocess.Popen(["true"])
     dead.wait()

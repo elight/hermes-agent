@@ -40,7 +40,7 @@ def fresh_home(tmp_path, monkeypatch):
 def test_list_comments_after_cursor(fresh_home):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="chat")
+        tid = kb.create_task(conn, title="chat", created_by="tester")
         c1 = kb.add_comment(conn, tid, author="alice", body="first")
         c2 = kb.add_comment(conn, tid, author="bob", body="second")
 

@@ -42,7 +42,7 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _running_task(conn, title="t", parents=()):
     """Create a task (linked under ``parents`` first) and drive it to ``running`` so block_task can act."""
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, assignee="worker", created_by="tester")
     for parent in parents:
         kb.link_tasks(conn, parent_id=parent, child_id=tid)
     with kb.write_txn(conn):
@@ -94,7 +94,7 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:
     """A dependency-parked child becomes ready once its parent completes."""
     with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
+        parent = kb.create_task(conn, title="parent", assignee="worker", created_by="tester")
         child = _running_task(conn, title="child")
         kb.link_tasks(
             conn,
@@ -122,7 +122,7 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
     CLI, and count toward the loop breaker so a re-block after an unblock
     reaches ``triage``."""
     with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="already-done-parent", assignee="worker")
+        parent = kb.create_task(conn, title="already-done-parent", assignee="worker", created_by="tester")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (parent,))
         # The edge exists before the run: link_tasks refuses to gate a running child retroactively.
@@ -163,10 +163,10 @@ def test_dependency_block_with_open_parent_stays_parked_across_dispatch_tick(
         return 4242
 
     with kbc.connect() as conn:
-        parent = kb.create_task(conn, title="open-parent", assignee="alice")
+        parent = kb.create_task(conn, title="open-parent", assignee="alice", created_by="tester")
         # Linked while todo (a running child cannot be gated retroactively); the parent then stays
         # open while the child runs — the reopened-parent shape, forced the same way the loop below does.
-        child = kb.create_task(conn, title="waiter", assignee="worker")
+        child = kb.create_task(conn, title="waiter", assignee="worker", created_by="tester")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='running' WHERE id=?", (child,))

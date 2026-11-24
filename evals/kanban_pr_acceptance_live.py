@@ -18,8 +18,8 @@ import inspect
 
 def create(conn, title):
     if 'completion_contract' in inspect.signature(kb.create_task).parameters:
-        return kb.create_task(conn, title=title, completion_contract='acme/repo')
-    tid = kb.create_task(conn, title=title)
+        return kb.create_task(conn, title=title, completion_contract='acme/repo', created_by="eval")
+    tid = kb.create_task(conn, title=title, created_by="eval")
     if 'completion_contract' not in {r[1] for r in conn.execute('PRAGMA table_info(tasks)')}:
         conn.execute('ALTER TABLE tasks ADD COLUMN completion_contract TEXT')
     conn.execute('UPDATE tasks SET completion_contract=? WHERE id=?', ('acme/repo', tid))
@@ -45,7 +45,7 @@ with tempfile.TemporaryDirectory(prefix='hermes-pr-live-') as home:
                 receipt = json.loads(row[0]) if row else None
                 reports.append({'case': outcome, 'accepted': accepted, 'status': kb.get_task(conn, tid).status, 'receipt': receipt})
             for outcome in (('success', 'failure') if 'completion_contract' in inspect.signature(kb.create_task).parameters else ()):
-                tid = kb.create_task(conn, title='Concurrent ownership', completion_contract='acme/repo')
+                tid = kb.create_task(conn, title='Concurrent ownership', completion_contract='acme/repo', created_by="eval")
                 owner = kb.claim_task(conn, tid)
                 run_id = owner.current_run_id
                 def reclaim():

@@ -61,7 +61,7 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", created_by="tester")
         kb.claim_task(conn, tid)
         run_id = kb._current_run_id(conn, tid)
     finally:
@@ -150,9 +150,9 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
-        b = kb.create_task(conn, title="beta", assignee="reviewer")
-        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other")
+        a = kb.create_task(conn, title="alpha", assignee="factory", priority=5, created_by="tester")
+        b = kb.create_task(conn, title="beta", assignee="reviewer", created_by="tester")
+        c = kb.create_task(conn, title="gamma", assignee="factory", tenant="other", created_by="tester")
     finally:
         conn.close()
 
@@ -384,7 +384,8 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
-            body="Must achieve X with verified evidence.", goal_mode=True
+            body="Must achieve X with verified evidence.", goal_mode=True,
+            created_by="tester",
         )
         kb.claim_task(conn, goal_task_id)
         run_id = kb._current_run_id(conn, goal_task_id)
@@ -465,7 +466,7 @@ def test_schedule_rejects_invalid_reason_and_unowned_contexts(monkeypatch, worke
     from tools import kanban_tools as kt
 
     with kbc.connect() as conn:
-        other = kb.create_task(conn, title="sibling", assignee="peer")
+        other = kb.create_task(conn, title="sibling", assignee="peer", created_by="tester")
 
     invalid = json.loads(kt._handle_schedule({"reason": {"until": "tomorrow"}}))
     foreign = json.loads(kt._handle_schedule({"task_id": other, "reason": "wait"}))
@@ -504,6 +505,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
             body="Must achieve X.", goal_mode=True,
+            created_by="tester",
         )
         kb.claim_task(conn, goal_task_id)
         run_id = kb._current_run_id(conn, goal_task_id)
@@ -668,7 +670,7 @@ def test_worker_the_dispatcher_never_recorded_keeps_its_claim_or_never_starts(mo
         assert kb.release_stale_claims(conn) == 0
         assert kb.get_task(conn, worker_env).status == "running"
 
-        late = kb.create_task(conn, title="late orphan", assignee="test-worker")
+        late = kb.create_task(conn, title="late orphan", assignee="test-worker", created_by="tester")
         kb.claim_task(conn, late)
         stale_run = kb._current_run_id(conn, late)
         _expire_claim(conn, late)
@@ -779,10 +781,10 @@ def test_link_running_child_allows_owner_but_rejects_foreign(monkeypatch, worker
     from tools import kanban_tools as kt
 
     with kbc.connect() as conn:
-        own_parent = kb.create_task(conn, title="own review")
+        own_parent = kb.create_task(conn, title="own review", created_by="tester")
         own_run_id = kb.get_task(conn, worker_env).current_run_id
-        foreign_parent = kb.create_task(conn, title="foreign review")
-        foreign_child = kb.create_task(conn, title="foreign worker")
+        foreign_parent = kb.create_task(conn, title="foreign review", created_by="tester")
+        foreign_child = kb.create_task(conn, title="foreign worker", created_by="tester")
         assert kb.claim_task(conn, foreign_child, claimer="other") is not None
 
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(own_run_id))
@@ -804,7 +806,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="blocked", assignee="worker")
+        tid = kb.create_task(conn, title="blocked", assignee="worker", created_by="tester")
         kb.block_task(conn, tid, reason="waiting")
     finally:
         conn.close()
@@ -837,8 +839,8 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        parent = kb.create_task(conn, title="parent", assignee="worker")
-        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
+        parent = kb.create_task(conn, title="parent", assignee="worker", created_by="tester")
+        child = kb.create_task(conn, title="child", assignee="worker", parents=[parent], created_by="tester")
         conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (child,))
         conn.commit()
     finally:
@@ -945,7 +947,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", created_by="tester")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
         conn.commit()
     finally:
@@ -978,7 +980,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        other = kb.create_task(conn, title="sibling")
+        other = kb.create_task(conn, title="sibling", created_by="tester")
     finally:
         conn.close()
 
@@ -1014,7 +1016,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     from hermes_cli import kanban_db_connect as kbc
     conn = kbc.connect()
     try:
-        other = kb.create_task(conn, title="blocked sibling", assignee="peer")
+        other = kb.create_task(conn, title="blocked sibling", assignee="peer", created_by="tester")
         kb.block_task(conn, other, reason="waiting")
     finally:
         conn.close()
@@ -1050,7 +1052,7 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="child to close out")
+        tid = kb.create_task(conn, title="child to close out", created_by="tester")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         conn.commit()
     finally:

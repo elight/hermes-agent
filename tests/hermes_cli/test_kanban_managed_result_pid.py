@@ -41,7 +41,7 @@ def _dead_pid() -> int:
 @pytest.mark.parametrize("bound_claim, expected", [("own", "rate_limited"), ("foreign", "crashed")])
 def test_managed_exit_75_requeues_rate_limited_not_crashed(conn, bound_claim, expected):
     host = kb._claimer_id().split(":", 1)[0]
-    tid = kb.create_task(conn, title="managed", assignee="w")
+    tid = kb.create_task(conn, title="managed", assignee="w", created_by="tester")
     task = kb.claim_task(conn, tid, claimer=f"{host}:owner")
     assert task is not None
     submitter, interpreter = _dead_pid(), _dead_pid()

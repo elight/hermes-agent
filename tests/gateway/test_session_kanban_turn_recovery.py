@@ -39,7 +39,7 @@ def _claimed_frame(tmp_path, monkeypatch, *, expired=False, goal_mode=False):
     kb.init_db()
     path = kb.kanban_db_path()
     with connect_closing(path) as conn:
-        task_id = kb.create_task(conn, title="recover", assignee="default")
+        task_id = kb.create_task(conn, title="recover", assignee="default", created_by="tester")
         task = kb.claim_task(conn, task_id, claimer="private-host:owner")
         assert task is not None
         with kb.write_txn(conn):

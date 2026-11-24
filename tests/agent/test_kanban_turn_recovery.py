@@ -274,7 +274,7 @@ def test_missing_db_pin_never_resolves_an_ambient_board(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     with kbc.connect() as conn:
-        task_id = kb.create_task(conn, title="ambient live task")
+        task_id = kb.create_task(conn, title="ambient live task", created_by="tester")
         assert kb.claim_task(conn, task_id, claimer="lk", ttl_seconds=3600) is not None
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
@@ -468,7 +468,7 @@ def owner_worker(tmp_path, clear_kanban_env, monkeypatch):
         kb.init_db()
         path = kb.kanban_db_path()
         with connect_closing(path) as conn:
-            task_id = kb.create_task(conn, title="recover", assignee="default")
+            task_id = kb.create_task(conn, title="recover", assignee="default", created_by="tester")
             task = kb.claim_task(conn, task_id, claimer="private-host:owner")
             assert task is not None
             with kb.write_txn(conn):

@@ -59,7 +59,7 @@ async def _run_one_notifier_tick(monkeypatch, runner):
 def _create_completed_task(*, subscribe: bool) -> str:
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="owner gate", assignee="worker")
+        tid = kb.create_task(conn, title="owner gate", assignee="worker", created_by="tester")
         if subscribe:
             kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.complete_task(conn, tid, summary="done")

@@ -33,7 +33,7 @@ def board_env(tmp_path, monkeypatch):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="identity-test", assignee="alpha")
+        tid = kb.create_task(conn, title="identity-test", assignee="alpha", created_by="tester")
         kb.claim_task(conn, tid)
     finally:
         conn.close()

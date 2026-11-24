@@ -22,7 +22,7 @@ from tui_gateway import server
 def _subscribed_task(chat_id: str) -> str:
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="stray sub", assignee="worker")
+        tid = kb.create_task(conn, title="stray sub", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform="tui", chat_id=chat_id)
         kb.complete_task(conn, tid, summary="shipped")
         return tid

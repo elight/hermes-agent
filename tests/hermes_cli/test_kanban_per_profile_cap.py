@@ -49,9 +49,9 @@ def test_cap_2_balances_two_profiles(isolated_kanban_home_with_profiles):
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
         for i in range(5):
-            kb.create_task(conn, title=f"a{i}", assignee="alpha")
+            kb.create_task(conn, title=f"a{i}", assignee="alpha", created_by="tester")
         for i in range(3):
-            kb.create_task(conn, title=f"b{i}", assignee="beta")
+            kb.create_task(conn, title=f"b{i}", assignee="beta", created_by="tester")
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn, dry_run=True,
@@ -76,7 +76,7 @@ def test_capped_tasks_dispatched_on_subsequent_tick(isolated_kanban_home_with_pr
     from hermes_cli import kanban_db_dispatch as kbd
     with kbc.connect_closing() as conn:
         kb.create_board(slug="default", name="Test")
-        [kb.create_task(conn, title=f"a{i}", assignee="alpha") for i in range(3)]
+        [kb.create_task(conn, title=f"a{i}", assignee="alpha", created_by="tester") for i in range(3)]
 
     # First tick: cap=1, only 1 alpha dispatched
     with kbc.connect_closing() as conn:

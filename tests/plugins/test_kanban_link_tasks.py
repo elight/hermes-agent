@@ -51,8 +51,8 @@ def api(kanban_home):
 def test_link_tasks_resolves_titles_both_sides(kanban_home, api):
     conn = kbc.connect()
     try:
-        parent = kb.create_task(conn, title="Parent title")
-        child = kb.create_task(conn, title="Child title")
+        parent = kb.create_task(conn, title="Parent title", created_by="tester")
+        child = kb.create_task(conn, title="Child title", created_by="tester")
         kb.link_tasks(conn, parent_id=parent, child_id=child)
     finally:
         conn.close()
@@ -72,7 +72,7 @@ def test_link_tasks_resolves_titles_both_sides(kanban_home, api):
 def test_link_tasks_empty_when_no_links(kanban_home, api):
     conn = kbc.connect()
     try:
-        task_id = kb.create_task(conn, title="Loner")
+        task_id = kb.create_task(conn, title="Loner", created_by="tester")
     finally:
         conn.close()
 

@@ -47,7 +47,8 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     from hermes_cli import kanban_db_connect as kbc
     with kbc.connect() as conn:
         kb.create_task(
-            conn, title="acp task", assignee="alice", session_id="acp-x"
+            conn, title="acp task", assignee="alice", session_id="acp-x",
+            created_by="tester",
         )
     raw = kc.run_slash("list --json")
     payload = json.loads(raw)
@@ -65,7 +66,7 @@ def test_run_slash_stats_text_includes_review_lane(kanban_home):
     import re
 
     with kbc.connect_closing() as conn:
-        tid = kb.create_task(conn, title="needs review", assignee="alice")
+        tid = kb.create_task(conn, title="needs review", assignee="alice", created_by="tester")
         assert kb.request_review(conn, tid, summary="s", force=True)
 
     assert re.search(r"review\s+1", kc.run_slash("stats"))
@@ -75,9 +76,10 @@ def test_run_slash_stats_text_includes_review_lane(kanban_home):
 def test_kanban_show_json_includes_runtime_limit(kanban_home):
     with kbc.connect() as conn:
         bounded_id = kb.create_task(
-            conn, title="bounded task", max_runtime_seconds=2700
+            conn, title="bounded task", max_runtime_seconds=2700,
+            created_by="tester",
         )
-        uncapped_id = kb.create_task(conn, title="uncapped task")
+        uncapped_id = kb.create_task(conn, title="uncapped task", created_by="tester")
 
     bounded = json.loads(kc.run_slash(f"show {bounded_id} --json"))
     uncapped = json.loads(kc.run_slash(f"show {uncapped_id} --json"))
@@ -88,8 +90,8 @@ def test_kanban_show_json_includes_runtime_limit(kanban_home):
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kbc.connect_closing() as conn:
-        parent_id = kb.create_task(conn, title="parent task")
-        child_id = kb.create_task(conn, title="child task")
+        parent_id = kb.create_task(conn, title="parent task", created_by="tester")
+        child_id = kb.create_task(conn, title="child task", created_by="tester")
         kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
 
     output = kc.run_slash(f"show {child_id}")
@@ -101,7 +103,7 @@ def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
 
 def test_kanban_show_text_renders_legacy_iso_completed_at(kanban_home):
     with kbc.connect_closing() as conn:
-        task_id = kb.create_task(conn, title="legacy stamp")
+        task_id = kb.create_task(conn, title="legacy stamp", created_by="tester")
         kb.complete_task(conn, task_id, result="ok", force=True)
         conn.execute("UPDATE tasks SET completed_at = '2026-09-30T14:22:11' WHERE id = ?", (task_id,))
         conn.commit()
@@ -119,7 +121,7 @@ def test_show_survives_iso_strings_in_integer_timestamp_columns(kanban_home):
     iso_utc = "2026-08-28T14:35:22+00:00"
     iso_z = "2026-08-28T16:58:56.613Z"
     with kbc.connect_closing() as conn:
-        task_id = kb.create_task(conn, title="corrupted card", assignee="alice")
+        task_id = kb.create_task(conn, title="corrupted card", assignee="alice", created_by="tester")
         assert kb.claim_task(conn, task_id)
         assert kb.complete_task(conn, task_id, summary="done")
         conn.execute("UPDATE task_runs SET ended_at = ? WHERE task_id = ?", (iso_utc, task_id))
@@ -139,7 +141,7 @@ def test_show_survives_iso_strings_in_integer_timestamp_columns(kanban_home):
 
 def test_kanban_edit_updates_documented_task_fields(kanban_home):
     with kbc.connect_closing() as conn:
-        task_id = kb.create_task(conn, title="old title", body="old body", priority=2)
+        task_id = kb.create_task(conn, title="old title", body="old body", priority=2, created_by="tester")
 
     kc.run_slash(
         f"edit {task_id} --title 'new title' --body 'new body' --priority 70"
@@ -154,12 +156,12 @@ def test_kanban_edit_updates_documented_task_fields(kanban_home):
 
 def test_worker_link_preserves_foreign_child_rules(kanban_home, monkeypatch):
     with kbc.connect_closing() as conn:
-        worker = kb.create_task(conn, title="worker")
+        worker = kb.create_task(conn, title="worker", created_by="tester")
         assert kb.claim_task(conn, worker, claimer="worker") is not None
         worker_run_id = kb.get_task(conn, worker).current_run_id
-        parent = kb.create_task(conn, title="unfinished parent")
-        ready_child = kb.create_task(conn, title="foreign ready child")
-        running_child = kb.create_task(conn, title="foreign running child")
+        parent = kb.create_task(conn, title="unfinished parent", created_by="tester")
+        ready_child = kb.create_task(conn, title="foreign ready child", created_by="tester")
+        running_child = kb.create_task(conn, title="foreign running child", created_by="tester")
         assert kb.claim_task(conn, running_child, claimer="other") is not None
 
     monkeypatch.setenv("HERMES_KANBAN_TASK", worker)

@@ -38,7 +38,7 @@ def test_reassign_inside_claim_window_does_not_spawn_unvetted_profile(
 ):
     spawned_as: list[str] = []
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="card", assignee="worker-a")
+        tid = kb.create_task(conn, title="card", assignee="worker-a", created_by="tester")
         if lane == "review":
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (tid,))
@@ -74,7 +74,7 @@ def test_reassign_before_default_fill_does_not_log_phantom_assignment(
     """A stale unassigned snapshot must not overwrite a real reassignment in the audit log."""
     spawned_as: list[str] = []
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="unassigned", assignee=None)
+        tid = kb.create_task(conn, title="unassigned", assignee=None, created_by="tester")
         real_apply = kbda.apply_default_assignee
 
         def assign_before_default(c, task_id, assignee, *, dry_run):
@@ -111,7 +111,7 @@ def test_failed_default_fill_write_still_buckets_unassigned(
 ):
     """A fill-in whose write failed (no concurrent assign) keeps the card visible as unassigned."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="unassigned", assignee=None)
+        tid = kb.create_task(conn, title="unassigned", assignee=None, created_by="tester")
 
         def boom(*_a, **_k):
             raise sqlite3.OperationalError("disk I/O error")

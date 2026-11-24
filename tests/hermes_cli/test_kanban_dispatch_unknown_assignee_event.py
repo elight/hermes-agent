@@ -29,7 +29,7 @@ def test_unknown_assignee_skip_writes_per_task_event(tmp_path, monkeypatch):
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="demo", assignee="no-such-profile")
+        tid = kb.create_task(conn, title="demo", assignee="no-such-profile", created_by="tester")
         res = kbd.dispatch_once(conn, dry_run=False)
         kinds = [(e.kind, e.payload) for e in kb.list_events(conn, tid)]
         task = kb.get_task(conn, tid)
@@ -48,7 +48,7 @@ def test_unknown_assignee_skip_event_is_written_once(tmp_path, monkeypatch):
     from hermes_cli import profiles
     monkeypatch.setattr(profiles, "profile_exists", lambda name: False)
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="demo", assignee="no-such-profile")
+        tid = kb.create_task(conn, title="demo", assignee="no-such-profile", created_by="tester")
         kbd.dispatch_once(conn, dry_run=True)
         assert "skipped_nonspawnable" not in [e.kind for e in kb.list_events(conn, tid)]
         for _ in range(3):

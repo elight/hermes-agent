@@ -258,7 +258,7 @@ def test_notifier_seam_connect_lands_on_pinned_db(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(pinned))
     kb.init_db()
     with kbc.connect() as conn:  # what the dispatcher/notifier box writes
-        kb.create_task(conn, title="pinned task", assignee="worker")
+        kb.create_task(conn, title="pinned task", assignee="worker", created_by="tester")
     # The notifier polls every enumerated slug; before the fix this opened
     # each slug's own (empty) DB and found nothing.
     with kb.pin_first_board_resolution():

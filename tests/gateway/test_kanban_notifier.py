@@ -59,7 +59,7 @@ def _make_runner(adapter):
 def _create_completed_subscription(summary="done once"):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="notify once", assignee="worker")
+        tid = kb.create_task(conn, title="notify once", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb.complete_task(conn, tid, summary=summary)
         return tid
@@ -94,6 +94,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
             title="dm topic task",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -145,7 +146,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     reason = "AGE-39 — https://linear.example/AGE-39 — publishing verified."
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="approval", assignee="publisher")
+        tid = kb.create_task(conn, title="approval", assignee="publisher", created_by="tester")
         kbn.add_notify_sub(
             conn,
             task_id=tid,
@@ -180,6 +181,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     try:
         foreign_tid = kb.create_task(
             conn, title="default-owned", assignee="worker",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -192,6 +194,7 @@ def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
 
         owned_tid = kb.create_task(
             conn, title="writer-owned", assignee="worker",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -225,7 +228,7 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
     kb.init_db()
     conn = kbc.connect()
     try:
-        task_id = kb.create_task(conn, title="legacy", assignee="worker")
+        task_id = kb.create_task(conn, title="legacy", assignee="worker", created_by="tester")
         kbn.add_notify_sub(
             conn,
             task_id=task_id,
@@ -311,7 +314,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="cycle test", assignee="worker")
+        tid = kb.create_task(conn, title="cycle test", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         # First crash — fired by the dispatcher when the worker PID dies.
         kb._append_event(conn, tid, kind="crashed")
@@ -370,6 +373,7 @@ def test_notifier_subscription_survives_done_reopen_until_archive(
             title="review continuation",
             assignee="worker",
             session_id="origin-session",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -471,6 +475,7 @@ def test_notifier_wakeup_uses_subscription_chat_type(tmp_path, monkeypatch):
             title="dm requester",
             assignee="worker",
             session_id="origin-session",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -537,11 +542,11 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     # scan order entirely.
     conn = kbc.connect()
     try:
-        tid_bad = kb.create_task(conn, title="bad task", assignee="worker")
+        tid_bad = kb.create_task(conn, title="bad task", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid_bad, platform="telegram", chat_id="chat-bad")
         kb.complete_task(conn, tid_bad, summary="done")
 
-        tid_good = kb.create_task(conn, title="good task", assignee="worker")
+        tid_good = kb.create_task(conn, title="good task", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid_good, platform="telegram", chat_id="chat-good")
         kb.complete_task(conn, tid_good, summary="done")
     finally:
@@ -593,7 +598,7 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="loops forever", assignee="worker")
+        tid = kb.create_task(conn, title="loops forever", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         kb._append_event(
             conn, tid, "block_loop_detected",
@@ -704,6 +709,7 @@ def _review_handoff_task(
             title="implement the thing",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,
@@ -755,6 +761,7 @@ def test_block_loop_detected_wakes_the_origin_session(tmp_path, monkeypatch):
             title="loops forever",
             assignee="worker",
             session_id="agent:main:telegram:dm:chat-1",
+            created_by="tester",
         )
         kbn.add_notify_sub(
             conn,

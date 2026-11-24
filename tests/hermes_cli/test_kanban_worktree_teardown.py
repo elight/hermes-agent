@@ -226,7 +226,7 @@ def test_tree_dirtied_between_check_and_removal_preserved(
 
 
 def _worktree_task(conn, repo: Path, title: str = "wt-task") -> tuple[str, Path]:
-    tid = kb.create_task(conn, title=title, assignee="worker")
+    tid = kb.create_task(conn, title=title, assignee="worker", created_by="tester")
     wt = _make_worktree(repo, tid)
     with kb.write_txn(conn):
         conn.execute(
@@ -272,7 +272,7 @@ def test_parent_worktree_deferred_until_children_done(
 ) -> None:
     with kbc.connect_closing() as conn:
         parent, parent_wt = _worktree_task(conn, repo, title="parent")
-        child = kb.create_task(conn, title="child", assignee="worker")
+        child = kb.create_task(conn, title="child", assignee="worker", created_by="tester")
         kb.link_tasks(conn, parent, child)
 
         with kb.write_txn(conn):
@@ -291,7 +291,7 @@ def test_parent_worktree_deferred_until_children_done(
 
 
 def _running_scratch_parent(conn, title: str = "parent") -> tuple[str, Path]:
-    tid = kb.create_task(conn, title=title)
+    tid = kb.create_task(conn, title=title, created_by="tester")
     assert kb.claim_task(conn, tid) is not None  # -> running
     ws = Path(kbw.resolve_workspace(kb.get_task(conn, tid)))
     kbw.set_workspace_path(conn, tid, ws)
@@ -312,7 +312,7 @@ def test_live_parent_scratch_survives_last_child_archived(
     with kbc.connect_closing() as conn:
         parent, ws = _running_scratch_parent(conn)
         (ws / "work.txt").write_text("in progress", encoding="utf-8")
-        child = kb.create_task(conn, title="probe")
+        child = kb.create_task(conn, title="probe", created_by="tester")
         kb.link_tasks(conn, parent, child)
         if live_status == "blocked":
             assert kb.block_task(conn, parent, reason="waiting")
@@ -333,7 +333,7 @@ def test_live_parent_worktree_survives_last_child_archived(
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
         assert kb.claim_task(conn, parent, claimer="worker") is not None
-        child = kb.create_task(conn, title="probe")
+        child = kb.create_task(conn, title="probe", created_by="tester")
         kb.link_tasks(conn, parent, child)
         assert kb.archive_task(conn, child)
         assert kb.get_task(conn, parent).status == "running"
@@ -349,7 +349,7 @@ def test_terminal_scratch_parent_still_swept_after_last_child(
     with kbc.connect_closing() as conn:
         parent, ws = _running_scratch_parent(conn)
         (ws / "handoff.txt").write_text("x", encoding="utf-8")
-        child = kb.create_task(conn, title="probe")
+        child = kb.create_task(conn, title="probe", created_by="tester")
         kb.link_tasks(conn, parent, child)
         assert kb.complete_task(conn, parent, summary="parent done")
         assert ws.is_dir()  # live child still needs the handoff files

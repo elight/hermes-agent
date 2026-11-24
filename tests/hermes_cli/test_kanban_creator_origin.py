@@ -11,14 +11,14 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     kb.init_db()
     with kbc.connect_closing() as conn:
-        owner = kb.create_task(conn, title="owner", session_id="durable", triage=True)
+        owner = kb.create_task(conn, title="owner", session_id="durable", triage=True, created_by="tester")
         kn.add_notify_sub(conn, task_id=owner, platform="telegram", chat_id="chat",
                          delivery_mode="wake", notifier_profile="default")
         if surface == "builtin":
             tid = decompose_triage_task(conn, owner, root_assignee="default",
                                        children=[{"title": "child"}])[0]
         elif surface == "db":
-            tid = kb.create_task(conn, title="child", creator_task_id=owner)
+            tid = kb.create_task(conn, title="child", creator_task_id=owner, created_by="tester")
         else:
             import json
             import argparse
@@ -34,6 +34,6 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
         assert len(subs) == 1 and subs[0]["delivery_mode"] == "wake"
         assert not conn.execute("SELECT 1 FROM task_links WHERE child_id = ?", (tid,)).fetchone()
         # No ambient identity guessing in the storage API.
-        plain = kb.create_task(conn, title="plain", session_id="explicit")
+        plain = kb.create_task(conn, title="plain", session_id="explicit", created_by="tester")
         assert kb.get_task(conn, plain).session_id == "explicit"
         assert not kn.list_notify_subs(conn, plain)

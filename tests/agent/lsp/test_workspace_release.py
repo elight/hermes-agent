@@ -124,7 +124,7 @@ def _kanban_scratch(project, tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="scratch")
+        tid = kb.create_task(conn, title="scratch", created_by="tester")
         ws = kbw.resolve_workspace(kb.get_task(conn, tid))
         kbw.set_workspace_path(conn, tid, ws)
     (ws / ".git").mkdir()  # the worker cloned a project into its scratch dir

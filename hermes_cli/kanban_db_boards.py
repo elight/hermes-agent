@@ -35,6 +35,10 @@ def _default_board_display_name(slug: str) -> str:
     return " ".join(part.capitalize() for part in slug.replace("_", "-").split("-") if part) or slug
 
 
+def _board_meta_for(board: Optional[str]) -> dict:
+    return read_board_metadata(board if board else _kb.get_current_board())
+
+
 def read_board_metadata(board: Optional[str] = None) -> dict:
     """``board.json`` merged over defaults, plus ``slug`` and ``db_path``. Never
     raises — a missing/malformed file yields the synthesized entry."""

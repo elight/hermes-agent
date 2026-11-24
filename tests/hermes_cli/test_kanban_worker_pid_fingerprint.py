@@ -28,7 +28,7 @@ def board(tmp_path, monkeypatch):
 
 
 def _claimed_running(conn, *, pid: int, started_at, max_runtime=None) -> str:
-    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=max_runtime)
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=max_runtime, created_by="tester")
     kb.claim_task(conn, tid)
     kbd._set_worker_pid(conn, tid, pid)
     old = int(time.time()) - 3600
@@ -119,7 +119,7 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     conn = board
     killed = []
     monkeypatch.setattr(status, "_get_process_start_time", lambda pid: None)
-    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1)
+    tid = kb.create_task(conn, title="job", assignee="worker", max_runtime_seconds=1, created_by="tester")
     kb.claim_task(conn, tid)
     kbd._set_worker_pid(conn, tid, os.getpid())
     row = conn.execute("SELECT worker_started_at FROM tasks WHERE id = ?", (tid,)).fetchone()
@@ -141,7 +141,7 @@ def test_unverified_fingerprint_capture_never_authorizes_a_signal(board, monkeyp
     assert killed == []
 
     # The process is gone (a dead PID): the row is reclaimed like any dead worker, still no signal.
-    tid2 = kb.create_task(conn, title="job2", assignee="worker")
+    tid2 = kb.create_task(conn, title="job2", assignee="worker", created_by="tester")
     kb.claim_task(conn, tid2)
     with kb.write_txn(conn):
         conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ?, claim_expires = ? WHERE id = ?",

@@ -70,7 +70,7 @@ def captured_updates():
 def _make_task(title="t"):
     conn = kbc.connect()
     try:
-        return kb.create_task(conn, title=title, assignee="alice")
+        return kb.create_task(conn, title=title, assignee="alice", created_by="tester")
     finally:
         conn.close()
 

@@ -80,7 +80,7 @@ def test_pr_completion_requires_current_required_evidence(github):
     with connect() as conn:
         for conclusion in ("failure", "pending", "cancelled", "timed_out", "action_required", "neutral", "skipped", None, "success"):
             github.update(conclusion=conclusion, head="a" * 40)
-            tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo")
+            tid = kb.create_task(conn, title="Publish", completion_contract="acme/repo", created_by="tester")
             ok = kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert ok is (conclusion == "success")
             task = kb.get_task(conn, tid)
@@ -95,16 +95,16 @@ def test_pr_completion_requires_current_required_evidence(github):
         for fault in ("missing", "stale", "head_change"):
             github.update(conclusion="success", head="a" * 40)
             github[fault] = True
-            tid = kb.create_task(conn, title=fault, completion_contract="acme/repo")
+            tid = kb.create_task(conn, title=fault, completion_contract="acme/repo", created_by="tester")
             assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
             assert kb.get_task(conn, tid).status != "done"
             github.pop(fault)
         # Omission and a sibling repository cannot downgrade the stored declaration.
-        tid = kb.create_task(conn, title="publish", completion_contract="acme/repo")
+        tid = kb.create_task(conn, title="publish", completion_contract="acme/repo", created_by="tester")
         assert not kb.complete_task(conn, tid, summary="local green")
         assert not kb.complete_task(conn, tid, result="done", metadata={"published_pr": "https://github.com/other/repo/pull/7"})
         before = len(github["requests"])
-        local = kb.create_task(conn, title="local", completion_contract="local-only")
+        local = kb.create_task(conn, title="local", completion_contract="local-only", created_by="tester")
         assert kb.complete_task(conn, local, summary="https://github.com/acme/repo/pull/7 is background context")
         assert len(github["requests"]) == before
 
@@ -113,7 +113,7 @@ def test_pr_completion_requires_current_required_evidence(github):
 def test_acceptance_receipts_and_terminal_write_share_run_ownership(github):
     with connect() as conn:
         for conclusion in ("success", "failure"):
-            tid = kb.create_task(conn, title="race", completion_contract="acme/repo")
+            tid = kb.create_task(conn, title="race", completion_contract="acme/repo", created_by="tester")
             owner = kb.claim_task(conn, tid)
             run_id = owner.current_run_id
             def reclaim():
@@ -162,7 +162,7 @@ def test_acceptance_runs_gh_as_the_assignee_profile(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     kb.init_db()
     with connect() as conn:
-        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b", created_by="tester")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         assert kb.get_task(conn, tid).status != "done"
@@ -207,7 +207,7 @@ def test_assignee_without_own_gh_login_never_falls_through_to_ambient_login(tmp_
     monkeypatch.setenv("PATH", str(shim) + os.pathsep + os.environ["PATH"])
     kb.init_db()
     with connect() as conn:
-        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b")
+        tid = kb.create_task(conn, title="as-b", completion_contract="acme/repo", assignee="b", created_by="tester")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(
@@ -340,7 +340,7 @@ def test_assigned_card_with_unresolvable_profile_is_auth_not_ambient(tmp_path, m
     monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))  # any gh spawn would fail as infra
     kb.init_db()
     with connect() as conn:
-        tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost")
+        tid = kb.create_task(conn, title="as-ghost", completion_contract="acme/repo", assignee="ghost", created_by="tester")
         assert not kb.complete_task(conn, tid, result="done",
                                     metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
         receipt = json.loads(conn.execute(

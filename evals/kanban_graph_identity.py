@@ -33,10 +33,10 @@ def main():
     decompose = graph.decompose_triage_task
     specs = [{"title": "work", "assignee": "default"}]
     with kbc.connect_closing() as conn:
-        parent = kb.create_task(conn, title="prerequisite", tenant="business-a")
-        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[parent])
-        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a")
-        child = kb.create_task(conn, title="manual child", parents=[parent])
+        parent = kb.create_task(conn, title="prerequisite", tenant="business-a", created_by="eval")
+        root = kb.create_task(conn, title="root", triage=True, tenant="business-a", parents=[parent], created_by="eval")
+        downstream = kb.create_task(conn, title="downstream", parents=[root], tenant="business-a", created_by="eval")
+        child = kb.create_task(conn, title="manual child", parents=[parent], created_by="eval")
         tool = json.loads(_handle_create({"title": "tool child", "assignee": "default", "parents": [parent]}))
         assert tool["ok"]
         out = {"db_tenant": kb.get_task(conn, child).tenant,
@@ -60,13 +60,13 @@ def main():
         for _ in range(3):
             dispatch_once(conn, max_spawn=0)
         out["three_dispatch_ticks_stable"] = ids == list(conn.execute("SELECT id FROM tasks ORDER BY id"))
-        ingress_root = kb.create_task(conn, title="ingress", tenant="business-a", triage=True)
+        ingress_root = kb.create_task(conn, title="ingress", tenant="business-a", triage=True, created_by="eval")
         routing = _Routing("default", "default", True, [], {"default"})
         assert _apply_fanout(ingress_root, {"tasks": specs}, routing, "probe").ok
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (ingress_root,))
         out["fanout_ingress_repeat_refused"] = not _apply_fanout(ingress_root, {"tasks": specs}, routing, "probe").ok
-        race_root = kb.create_task(conn, title="race", tenant="business-a", triage=True)
+        race_root = kb.create_task(conn, title="race", tenant="business-a", triage=True, created_by="eval")
     barrier = threading.Barrier(2)
     def race():
         with kbc.connect_closing() as conn:

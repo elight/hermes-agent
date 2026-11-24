@@ -589,7 +589,7 @@ class TestMaybeAutoTitle:
         from hermes_cli import kanban_db, kanban_db_connect
 
         with kanban_db_connect.connect_closing(board="default") as conn:
-            task_id = kanban_db.create_task(conn, title="Fix flaky worker startup", board="default")
+            task_id = kanban_db.create_task(conn, title="Fix flaky worker startup", board="default", created_by="tester")
             conn.commit()
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
         db = storage_handle(tmp_path)
@@ -609,7 +609,7 @@ class TestMaybeAutoTitle:
         card = "Investigate why the swap modal intermittently fails to render its confirmation step on mobile Safari after a retry"
         assert len(card) > MAX_TITLE_LENGTH
         with kanban_db_connect.connect_closing(board="default") as conn:
-            task_id = kanban_db.create_task(conn, title=card, board="default")
+            task_id = kanban_db.create_task(conn, title=card, board="default", created_by="tester")
             conn.commit()
         monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
         db = storage_handle(tmp_path)

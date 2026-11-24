@@ -1236,6 +1236,23 @@ def _main_db_file(conn: sqlite3.Connection) -> Optional[str]:
     return None
 
 
+def require_created_by(created_by: Optional[str], conn: sqlite3.Connection) -> str:
+    """Refuse a task-creation write that names no actor (t_6406066c ruling).
+
+    Every real surface — the kanban_create tool, the CLI, the dashboard, the
+    swarm builder — stamps ``created_by`` with its own identity; a row with a
+    NULL/blank creator is the signature of a raw library call from a stray
+    script. Fail closed before anything is written, naming the board DB the
+    call would have hit so the operator can find the offending writer.
+    """
+    if created_by is None or not str(created_by).strip():
+        raise ValueError(
+            "created_by is required: refusing to write a task row without a "
+            f"creator (board database: {_main_db_file(conn) or '<in-memory>'})"
+        )
+    return created_by
+
+
 @contextlib.contextmanager
 def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
     """IMMEDIATE write transaction; a claim CAS inside is atomic — at most one

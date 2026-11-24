@@ -37,7 +37,7 @@ def board(tmp_path, monkeypatch):
 
 def test_list_survives_undecodable_and_blob_text_cells(board):
     with kbc.connect() as conn:
-        good = kb.create_task(conn, title="good card", assignee="coder")
+        good = kb.create_task(conn, title="good card", assignee="coder", created_by="tester")
         conn.execute(
             "INSERT INTO tasks (id, title, body, assignee, status, priority, created_by, created_at) "
             "VALUES ('t_text_bad', 'text invalid', CAST(X'FFFEABCD00' AS TEXT), 'coder', 'ready', 0, 'user', 1000)"
@@ -59,7 +59,7 @@ def test_list_survives_undecodable_and_blob_text_cells(board):
 
 def test_show_json_survives_blob_cells_in_sibling_tables(board):
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="card", assignee="coder")
+        tid = kb.create_task(conn, title="card", assignee="coder", created_by="tester")
         conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, 'user', X'FFFEABCD00', 1000)", (tid,),
@@ -82,7 +82,7 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
     ``bytes`` to a ``str`` regex, raising ``TypeError`` and killing the whole
     dispatch pass after the poisoned row."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="card", assignee="worker")
+        tid = kb.create_task(conn, title="card", assignee="worker", created_by="tester")
         kb.add_comment(conn, tid, author="worker", body="placeholder")
         with kb.write_txn(conn):
             conn.execute(

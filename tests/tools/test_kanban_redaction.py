@@ -33,7 +33,7 @@ def worker_env(monkeypatch, tmp_path):
     kb.init_db()
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        tid = kb.create_task(conn, title="worker-test", assignee="test-worker", created_by="tester")
         kb.claim_task(conn, tid)
         run_id = kb._current_run_id(conn, tid)
     finally:

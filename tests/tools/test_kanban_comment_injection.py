@@ -69,7 +69,7 @@ def test_noop_without_worker_env(worker_home, monkeypatch):
 def test_seed_then_inject_new_comment(worker_home, monkeypatch):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="live task")
+        tid = kb.create_task(conn, title="live task", created_by="tester")
         kb.add_comment(conn, tid, author="desktop", body="pre-existing note")
     finally:
         conn.close()
@@ -103,7 +103,7 @@ def test_seed_then_inject_new_comment(worker_home, monkeypatch):
 def test_skips_own_authored_comments(worker_home, monkeypatch):
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="echo guard")
+        tid = kb.create_task(conn, title="echo guard", created_by="tester")
     finally:
         conn.close()
 
@@ -133,7 +133,7 @@ def test_delegated_child_in_worker_process_neither_receives_nor_consumes_notes(w
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="live task")
+        tid = kb.create_task(conn, title="live task", created_by="tester")
     finally:
         conn.close()
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
@@ -167,7 +167,7 @@ def test_skips_own_authored_comments_without_env_profile(worker_home, monkeypatc
     own notes can never steer its live turn as fake operator messages."""
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="identity echo guard")
+        tid = kb.create_task(conn, title="identity echo guard", created_by="tester")
     finally:
         conn.close()
 

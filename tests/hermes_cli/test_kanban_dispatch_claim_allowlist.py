@@ -38,7 +38,7 @@ def test_allowlist_without_default_skips_default_card(kanban_home, all_assignees
         "kanban:\n  dispatch_profiles:\n    - sage\n", encoding="utf-8",
     )
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         assert kbd.has_spawnable_ready(conn) is False
         res = kbd.dispatch_once(conn, dry_run=True)
     assert res.spawned == []
@@ -56,7 +56,7 @@ def test_default_assignee_outside_allowlist_leaves_card_unassigned(
         encoding="utf-8",
     )
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="unassigned card")
+        tid = kb.create_task(conn, title="unassigned card", created_by="tester")
         res = kbd.dispatch_once(
             conn, dry_run=False, spawn_fn=lambda _t, _w: 4242,
             default_assignee="default",
@@ -72,7 +72,7 @@ def test_default_assignee_outside_allowlist_leaves_card_unassigned(
 def test_unset_allowlist_keeps_default_claimable(kanban_home, all_assignees_spawnable):
     """No key = upstream behaviour: any existing profile, ``default`` included."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="local card", assignee="default")
+        tid = kb.create_task(conn, title="local card", assignee="default", created_by="tester")
         assert kbd.has_spawnable_ready(conn) is True
         res = kbd.dispatch_once(conn, dry_run=True)
     assert [t for t, _a, _w in res.spawned] == [tid]
@@ -87,7 +87,7 @@ def test_profiles_import_failure_with_allowlist_claims_nothing(kanban_home, monk
         "kanban:\n  dispatch_profiles:\n    - sage\n", encoding="utf-8",
     )
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         monkeypatch.setitem(sys.modules, "hermes_cli.profiles", None)
         assert kbd.has_spawnable_ready(conn) is False
         assert kbd.dispatch_profile_allowlist_summary().startswith("none (fail-closed: profiles unavailable")
@@ -100,7 +100,7 @@ def test_profiles_import_failure_without_allowlist_keeps_gate_disabled(kanban_ho
     """No allowlist configured = gate disabled even when the profiles module
     cannot be imported (upstream behaviour unchanged)."""
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="local card", assignee="default")
+        tid = kb.create_task(conn, title="local card", assignee="default", created_by="tester")
         monkeypatch.setitem(sys.modules, "hermes_cli.profiles", None)
         res = kbd.dispatch_once(conn, dry_run=True)
     assert [t for t, _a, _w in res.spawned] == [tid]
@@ -111,7 +111,7 @@ def test_profiles_import_failure_without_allowlist_diagnostics_matches_dispatch(
     """If imports fail without an allowlist, diagnostics must say 'any', not
     'fail-closed': the dispatcher still claims ready cards in this state."""
     with kbc.connect() as conn:
-        kb.create_task(conn, title="local card", assignee="default")
+        kb.create_task(conn, title="local card", assignee="default", created_by="tester")
         monkeypatch.setitem(sys.modules, "hermes_cli.profiles", None)
         assert kbd.has_spawnable_ready(conn) is True
         assert kbd.dispatch_profile_allowlist_summary() == "any"
@@ -129,7 +129,7 @@ def test_present_blank_or_null_allowlist_skips_all_cards(
         f"kanban:\n  dispatch_profiles:{rendered}\n", encoding="utf-8",
     )
     with kbc.connect() as conn, caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         res = kbd.dispatch_once(conn, dry_run=True)
     assert res.spawned == []
     assert res.skipped_nonspawnable == [tid]
@@ -148,7 +148,7 @@ def test_allowlist_config_read_failure_skips_all_cards(
 
     monkeypatch.setattr(config_effective, "load_user_config_effective", raise_read_error)
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         res = kbd.dispatch_once(conn, dry_run=True)
     assert res.spawned == []
     assert res.skipped_nonspawnable == [tid]
@@ -172,7 +172,7 @@ def test_non_mapping_config_root_does_not_widen_claims(
     if warm:
         {"effective": load_user_config_effective, "raw": read_raw_config}[warm]()
     with kbc.connect() as conn, caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         assert kbd.has_spawnable_ready(conn) is False
         res = kbd.dispatch_once(conn, dry_run=True)
     assert res.spawned == []
@@ -194,7 +194,7 @@ def test_non_mapping_kanban_section_skips_all_cards(
     widening this home's claim scope to every existing profile (#147532)."""
     (kanban_home / "config.yaml").write_text(section, encoding="utf-8")
     with kbc.connect() as conn, caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
-        tid = kb.create_task(conn, title="foreign card", assignee="default")
+        tid = kb.create_task(conn, title="foreign card", assignee="default", created_by="tester")
         assert kbd.has_spawnable_ready(conn) is False
         res = kbd.dispatch_once(conn, dry_run=True)
     assert res.spawned == []

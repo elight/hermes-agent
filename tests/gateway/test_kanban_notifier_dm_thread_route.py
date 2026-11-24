@@ -60,7 +60,7 @@ def setup_runner(tmp_path, monkeypatch, routes):
 def dm_thread_subscription(*, task_owner="default", metadata=None):
     """A default-owned Slack DM thread subscription with no ``parent_chat_id``."""
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="dm thread completion", assignee="worker")
+        task = kb.create_task(conn, title="dm thread completion", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=task, platform="slack", chat_id=DM,
                            thread_id=THREAD_TS, chat_type="dm", user_id="U_CREATOR",
                            notifier_profile=task_owner, delivery_mode="notify+wake",
@@ -112,7 +112,7 @@ def test_a_thread_id_chat_still_needs_its_parent_anchor(tmp_path, monkeypatch):
     ])
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="discord thread completion", assignee="worker")
+        task = kb.create_task(conn, title="discord thread completion", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id="post", thread_id="post",
                            chat_type="thread", user_id="U_CREATOR", notifier_profile="default",
                            delivery_mode="notify", delivery_metadata={"guild_id": TEAM})
@@ -130,7 +130,7 @@ def test_an_untyped_legacy_thread_row_keeps_the_unknown_parent_gate(tmp_path, mo
     ])
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="legacy thread completion", assignee="worker")
+        task = kb.create_task(conn, title="legacy thread completion", assignee="worker", created_by="tester")
         kbn.add_notify_sub(conn, task_id=task, platform="discord", chat_id="post", thread_id="post",
                            chat_type="thread", user_id="U_CREATOR", notifier_profile="default",
                            delivery_mode="notify", delivery_metadata={"guild_id": TEAM})
@@ -154,7 +154,7 @@ def test_a_cli_thread_row_with_no_stated_chat_type_keeps_the_unknown_parent_gate
     ])
     runner.adapters = {Platform.DISCORD: RecordingAdapter()}
     with kbc.connect() as conn:
-        task = kb.create_task(conn, title="cli thread completion", assignee="worker")
+        task = kb.create_task(conn, title="cli thread completion", assignee="worker", created_by="tester")
     parser = argparse.ArgumentParser()
     kc.build_parser(parser.add_subparsers(dest="command"))
     assert kc.kanban_command(parser.parse_args([

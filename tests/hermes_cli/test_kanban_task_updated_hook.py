@@ -60,7 +60,7 @@ def test_assign_fires_updated_with_changed_fields(kanban_home, captured_updates)
 
     conn = kbc.connect()
     try:
-        tid = kb.create_task(conn, title="t", assignee="alice")
+        tid = kb.create_task(conn, title="t", assignee="alice", created_by="tester")
         captured_updates.clear()  # create-time bookkeeping is not under test
         assert kb.assign_task(conn, tid, "bob") is True
     finally:
@@ -87,7 +87,7 @@ def test_raising_callback_does_not_break_assign(kanban_home):
     try:
         conn = kbc.connect()
         try:
-            tid = kb.create_task(conn, title="t", assignee="alice")
+            tid = kb.create_task(conn, title="t", assignee="alice", created_by="tester")
             assert kb.assign_task(conn, tid, "bob") is True
             assert kb.get_task(conn, tid).assignee == "bob"
         finally:
