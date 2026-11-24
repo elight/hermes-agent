@@ -16,7 +16,24 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
+from hermes_cli import kanban_dispatch_cap
 from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
+
+
+def _profile_cap_notice(cap, source: str) -> str:
+    """One line saying which per-profile cap this pass ran under, and why.
+
+    ``unset`` is the line that matters most: an operator watching a pass start every ready card
+    for one profile needs to be able to tell "no cap was ever configured" from "the cap said
+    stop", which until now was invisible from the terminal.
+    """
+    if source == kanban_dispatch_cap.SOURCE_UNSET:
+        return ("Per-profile cap: none — kanban.max_in_progress_per_profile is unset, which "
+                "means unlimited. Pass --max N to bound this run.")
+    if source == kanban_dispatch_cap.SOURCE_OPTED_OUT:
+        return ("Per-profile cap: none — kanban.max_in_progress_per_profile is 0 (unlimited). "
+                "Pass --max N to bound this run.")
+    return f"Per-profile cap: {cap} (kanban.max_in_progress_per_profile)"
 
 
 def _kanban_config() -> dict:
@@ -61,26 +78,48 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
+    from hermes_cli.config import FailedConfigRead, load_config
+    configured_profile_cap = None
     try:
-        from hermes_cli.config import load_config
         _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
-        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        max_in_progress_per_profile = kbd._positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile"), None
-        )
-        # Memory-derived default when unset — same fallback the gateway applies.
-        max_in_progress = kbd.resolve_max_in_progress(
-            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
-        )
-        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
-        cli_max = getattr(args, "max", None)
-        max_spawn = (
-            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
-        )
-    except Exception:
-        default_assignee = max_in_progress_per_profile = max_in_progress = None
-        max_spawn = getattr(args, "max", None)
+    except Exception as exc:  # health: allow BLE001 -- the READ itself can fail in every shape; any of them must refuse the pass
+        # "I could not read the config" is NOT "the operator configured nothing". This handler
+        # used to null every cap and dispatch anyway, so a broken config unlocked exactly the
+        # one-profile fan-out this command is meant to avoid. Refuse instead — the same shape
+        # kanban.dispatch_profiles already documents for a failed config read (fail closed).
+        # Scoped to the read alone: everything below parses a dict already in hand, so a bug of
+        # ours surfaces as itself rather than as a phantom config error.
+        _err(f"kanban dispatch: cannot read config ({exc}); refusing to dispatch with no "
+             "caps resolved. Repair config.yaml, then run again.")
+        return 1
+    # ``load_config`` does NOT raise on a broken file, so the ``except`` above guards almost
+    # nothing on its own: the failure this function exists to catch arrives as a perfectly
+    # ordinary dict — ``FailedConfigRead``, the documented fail-open fallback, which may even
+    # carry the operator's last good values inside it. Measured: with a last-known-good copy
+    # available the read still returns FailedConfigRead (cap 2 intact inside it), and with no
+    # copy it returns FailedConfigRead with defaults. A caller cannot tell those apart from
+    # outside, so both refuse: a pass that starts workers costing a full model context each
+    # does not run on a config the loader itself refuses to call readable.
+    if isinstance(_cfg, FailedConfigRead):
+        _err(f"kanban dispatch: cannot read config ({getattr(_cfg, 'read_error', 'unreadable')}); "
+             "refusing to dispatch with no caps resolved. Any last-known-good copy is still on "
+             "disk and in backups/config/. Repair config.yaml (or run `hermes config check`), "
+             "then run again.")
+        return 1
+    _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+    default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+    # Raw on purpose: 0 is an operator's decision, and an absent key means unlimited.
+    configured_profile_cap = _kanban_cfg.get("max_in_progress_per_profile")
+    # Memory-derived default when unset — same fallback the gateway applies.
+    max_in_progress = kbd.resolve_max_in_progress(
+        kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+    )
+    # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
+    cli_max = getattr(args, "max", None)
+    max_spawn = (
+        cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
+    )
+    profile_cap, cap_source = kanban_dispatch_cap.resolve_profile_cap(configured_profile_cap)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
@@ -89,7 +128,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+            max_in_progress_per_profile=profile_cap,
         )
     if getattr(args, "json", False):
         _print_json({
@@ -113,6 +152,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            # Which per-profile cap the pass actually ran under, and why — so a scripted
+            # operator can tell "capped" from "uncapped because config didn't resolve".
+            "per_profile_cap": profile_cap,
+            "per_profile_cap_source": cap_source,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -128,6 +171,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         if items:
             print(f"  {', '.join(items)}")
     print(f"Promoted:     {res.promoted}")
+    print(_profile_cap_notice(profile_cap, cap_source))
     print(f"Spawned:      {len(res.spawned)}")
     tag = " (dry)" if args.dry_run else ""
     for tid, who, ws in res.spawned:

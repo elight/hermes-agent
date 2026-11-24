@@ -1884,26 +1884,6 @@ def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
     return derive_default_max_in_progress()
 
 
-def configured_max_in_progress() -> Optional[int]:
-    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
-
-    Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
-    except Exception:
-        return None
-    if raw is None:
-        return None
-    try:
-        ival = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return ival if ival >= 1 else None
-
-
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2880,12 +2860,18 @@ def run_daemon(
             # Re-resolved every tick (config load is mtime-cached) so operator
             # edits apply without a restart.
             max_in_progress = resolve_max_in_progress(configured_max_in_progress())
+            # Same per-profile cap the gateway tick and the CLI pass resolve. Read here,
+            # not at boot, so a config edit lands on the next tick; fail-closed default so
+            # this stays the capped entry point its docstring promises.
+            from hermes_cli import kanban_dispatch_cap
+            profile_cap, _cap_source = kanban_dispatch_cap.resolve_entry_point_cap()
             with contextlib.closing(_kbc.connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
                     failure_limit=failure_limit,
+                    max_in_progress_per_profile=profile_cap,
                 )
             if on_tick is not None:
                 with contextlib.suppress(Exception):
@@ -2903,3 +2889,8 @@ from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
 from hermes_cli import kanban_db_default_assignee as _kbda
 from hermes_cli import kanban_db_workspace as _kbw
+# ``configured_max_in_progress`` moved to kanban_dispatch_cap (which now owns what the
+# kanban.* cap keys mean, and what a forced pass falls back to). Re-exported because this is
+# where run_daemon, the gateway and tests resolve the name — a facade attribute is also what
+# monkeypatch targets, so patching kbd still steers the tick defined above.
+from hermes_cli.kanban_dispatch_cap import configured_max_in_progress
