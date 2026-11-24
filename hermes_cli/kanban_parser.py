@@ -362,11 +362,9 @@ _SPECS = [
     _cmd("tail", [_TASK_ID, _arg("--interval", type=float, default=1.0)], help="Follow a task's event stream"),
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
-        _arg("--max", type=int, help="Cap number of spawns this pass"),
-        _arg("--ignore-cap", action="store_true",
-             help="Ignore the per-profile in-flight cap for this pass. Without it a pass that "
-                  "starts workers is capped at kanban.max_in_progress_per_profile, and at one "
-                  "per profile when that key is unset — each worker boots a full model context"),
+        _arg("--max", type=int, help="Cap number of spawns this pass. The per-profile limit comes "
+             "from kanban.max_in_progress_per_profile, whose default is unset = unlimited, so "
+             "--max is how an operator bounds one pass by hand"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),

@@ -23,20 +23,17 @@ from hermes_cli.kanban_output import _err, _fmt_ts, _print_json
 def _profile_cap_notice(cap, source: str) -> str:
     """One line saying which per-profile cap this pass ran under, and why.
 
-    The two sources an operator should never have to infer: ``defaulted`` explains why only
-    one card started on a board full of ready work, ``bypassed`` states plainly what was
-    given up, since nobody types ``--ignore-cap`` by accident.
+    ``unset`` is the line that matters most: an operator watching a pass start every ready card
+    for one profile needs to be able to tell "no cap was ever configured" from "the cap said
+    stop", which until now was invisible from the terminal.
     """
-    if source == kanban_dispatch_cap.SOURCE_BYPASSED:
-        return ("Per-profile cap: none — --ignore-cap gave up dispatch policy for this "
-                "pass; every ready card assigned to an idle profile can start")
+    if source == kanban_dispatch_cap.SOURCE_UNSET:
+        return ("Per-profile cap: none — kanban.max_in_progress_per_profile is unset, which "
+                "means unlimited. Pass --max N to bound this run.")
     if source == kanban_dispatch_cap.SOURCE_OPTED_OUT:
-        return "Per-profile cap: none (kanban.max_in_progress_per_profile is 0)"
-    if source == kanban_dispatch_cap.SOURCE_DEFAULTED:
-        return (f"Per-profile cap: {cap} (kanban.max_in_progress_per_profile is unset, and a "
-                "forced pass must not start one profile's whole queue at once; pass "
-                "--ignore-cap to override)")
-    return f"Per-profile cap: {cap}"
+        return ("Per-profile cap: none — kanban.max_in_progress_per_profile is 0 (unlimited). "
+                "Pass --max N to bound this run.")
+    return f"Per-profile cap: {cap} (kanban.max_in_progress_per_profile)"
 
 
 def _kanban_config() -> dict:
@@ -87,7 +84,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         _cfg = load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-        # Raw on purpose: 0 is an operator's decision and an unreadable config is not.
+        # Raw on purpose: 0 is an operator's decision, and an absent key means unlimited.
         configured_profile_cap = _kanban_cfg.get("max_in_progress_per_profile")
         # Memory-derived default when unset — same fallback the gateway applies.
         max_in_progress = kbd.resolve_max_in_progress(
@@ -98,17 +95,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = (
             cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
         )
-    except Exception:
-        # ``configured_profile_cap`` stays None rather than becoming "uncapped": a broken
-        # config used to null every cap here, which read as "spawn the whole queue".
-        default_assignee = max_in_progress = None
-        max_spawn = getattr(args, "max", None)
-    # A forced pass is an operator reaching for the dispatcher by hand, and the accident it
-    # causes is one profile starting its entire ready queue at once — each worker booting a
-    # full model context. Resolve fail-closed; ``--ignore-cap`` is the deliberate door.
-    profile_cap, cap_source = kanban_dispatch_cap.resolve_profile_cap(
-        configured_profile_cap, ignore_cap=getattr(args, "ignore_cap", False),
-    )
+    except Exception as exc:  # health: allow BLE001 -- ANY config failure must refuse the pass; load_config raises yaml/os/decode errors
+        # "I could not read the config" is NOT "the operator configured nothing". This handler
+        # used to null every cap and dispatch anyway, so a broken config unlocked exactly the
+        # one-profile fan-out this command is meant to avoid. Refuse instead — the same shape
+        # kanban.dispatch_profiles already documents for a failed config read (fail closed).
+        _err(f"kanban dispatch: cannot read config ({exc}); refusing to dispatch with no "
+             "caps resolved. Repair config.yaml, then run again.")
+        return 1
+    profile_cap, cap_source = kanban_dispatch_cap.resolve_profile_cap(configured_profile_cap)
     with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,

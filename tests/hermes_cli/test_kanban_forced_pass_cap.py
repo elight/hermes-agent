@@ -1,22 +1,24 @@
-"""A forced dispatch pass must never fan out unbounded for one profile.
+"""A forced dispatch pass must mean what the gateway means by the same config key.
 
-``hermes kanban dispatch``, the deprecated ``kanban daemon`` loop and the dashboard's
-``POST /dispatch`` nudge all build a ``dispatch_once`` call by hand. Only the CLI reads
-``kanban.max_in_progress_per_profile``, and when that key does not resolve its fallback is
-*no cap at all*: five ready cards for one profile became five workers in one pass. The
-gateway tick is the only path that resolves the cap, and even it depends on the config
-being readable.
+Four places start a dispatcher pass. The gateway tick and the CLI read
+``kanban.max_in_progress_per_profile``; ``run_daemon`` and the dashboard's ``POST /dispatch``
+passed no per-profile cap at all, so on a box where the key IS configured, those two could
+start one profile's ready queue unchecked — an operator nudging the dispatcher by hand got a
+different answer than the tick they were waiting for, and the fan-out each worker pays for is
+a full model context.
 
-Core already refuses the analogous hazard for the *global* cap — ``resolve_max_in_progress``
-applies a memory-derived default because "unbounded fan-out swap-thrashes small hosts"
-(``gateway/kanban_watchers_dispatcher.py``). The per-profile cap had no such default. These
-tests pin the fail-closed default, the two ways an operator deliberately opts out (``0`` in
-config, ``--ignore-cap`` on the command line), and the sibling entry points.
+The key's documented default stays *unset (unlimited)*
+(``website/docs/user-guide/features/kanban.md``), so nothing here invents a cap the operator
+did not configure; ``--max`` remains the way to bound one pass by hand. What did change: the
+key is honoured on every path, a pass prints which cap it ran under, and a config that cannot
+be READ stops the pass instead of unlocking it — because "could not read" is not the same
+statement as "configured nothing".
 """
 from __future__ import annotations
 
 import argparse
 import contextlib
+import io
 import os
 import sys
 import tempfile
@@ -65,7 +67,6 @@ def capped_env(isolated_kanban_home, monkeypatch):
             with kb.write_txn(conn):
                 conn.execute("UPDATE tasks SET status = 'ready'")
                 conn.execute("UPDATE tasks SET consecutive_failures = 0")
-        return spawned
 
     return make_ready, spawned
 
@@ -73,11 +74,10 @@ def capped_env(isolated_kanban_home, monkeypatch):
 def _dispatch_cli(monkeypatch, args=None):
     """Run the real ``hermes kanban dispatch`` verb.
 
-    Returns ``(dispatch_once_kwargs, text_printed_to_stdout)`` — stdout is captured here
-    rather than via ``capsys`` because the verb prints its own summary.
+    Returns ``(exit_code, dispatch_once_kwargs, stdout)``. Stdout is captured here rather than
+    via ``capsys`` because the verb prints its own summary; kwargs stay empty if the verb
+    refused to dispatch at all, which is itself an assertion worth making.
     """
-    import io
-
     from hermes_cli import kanban_db_dispatch as kbd
 
     captured: dict = {}
@@ -95,166 +95,62 @@ def _dispatch_cli(monkeypatch, args=None):
         vars(ns).update(args)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        kanban_ops._cmd_dispatch(ns)
-    return captured, buf.getvalue()
+        rc = kanban_ops._cmd_dispatch(ns)
+    return rc, captured, buf.getvalue()
 
 
 # --------------------------------------------------------------------------- #
-# D1: no cap resolving must fail closed, not open                            #
+# The cap means the same thing on every path                                  #
 # --------------------------------------------------------------------------- #
 
-def test_forced_pass_defaults_the_per_profile_cap_when_the_key_is_unset(isolated_kanban_home,
-                                                                       monkeypatch):
-    """kanban.max_in_progress_per_profile absent ⇒ a forced pass still caps per profile.
+def test_configured_cap_holds_on_a_forced_pass(isolated_kanban_home, capped_env, monkeypatch):
+    """Five ready cards, one profile, one real pass, cap configured ⇒ one worker.
 
-    Absent is not "unlimited" for a one-shot pass an operator runs by hand: the whole point
-    of the pass is to unstick a board, and the accident it causes is five workers at once.
-    """
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    captured, _out = _dispatch_cli(monkeypatch)
-    assert captured.get("max_in_progress_per_profile") == 1, (
-        "a forced pass with no per-profile cap configured must fall back to a conservative "
-        f"default, not uncapped; got {captured.get('max_in_progress_per_profile')!r}"
-    )
-
-
-def test_forced_pass_does_not_fan_out_five_cards_for_one_profile(isolated_kanban_home,
-                                                                capped_env,
-                                                                monkeypatch):
-    """The card's headline: 5 ready cards, one profile, ONE pass, cap unset ⇒ one worker.
-
-    End-to-end through the real ``dispatch_once`` with a stubbed spawner — the number of
-    workers actually started, not a kwarg someone remembered to forward.
+    Driven through the real ``dispatch_once`` with only the spawner stubbed, so the assertion
+    is the number of workers started, not a kwarg someone remembered to forward.
     """
     make_ready, spawned = capped_env
     monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress": 4}})
+                        lambda: {"kanban": {"max_in_progress_per_profile": 2}})
     make_ready(5)
     _dispatch_cli(monkeypatch)
-    assert len(spawned) == 1, (
-        f"one forced pass started {len(spawned)} workers for a single profile; the cap "
-        "must hold whether or not the operator remembered to configure it"
+    assert len(spawned) == 2, (
+        f"a configured per-profile cap of 2 started {len(spawned)} workers in one pass"
     )
 
 
-def test_unreadable_config_fails_closed_not_uncapped(isolated_kanban_home, monkeypatch):
-    """A config that raises must not silently disable the per-profile cap.
+def test_daemon_and_dashboard_honour_the_configured_cap(isolated_kanban_home, monkeypatch):
+    """The two paths that passed no per-profile cap at all now forward the configured one.
 
-    ``_cmd_dispatch`` wraps its whole config read in ``except Exception`` and nulls every
-    cap on the way out; a broken config then reads as "spawn everything".
+    ``run_daemon``'s own docstring: "the standalone daemon must not be the one uncapped entry
+    point." Before this it was, and so was the dashboard nudge (default ``max=8``).
     """
-    def boom():
-        raise RuntimeError("config.yaml is unparseable")
-
-    monkeypatch.setattr("hermes_cli.config.load_config", boom)
-    captured, _out = _dispatch_cli(monkeypatch)
-    assert captured.get("max_in_progress_per_profile") == 1, (
-        "an unreadable config left the per-profile cap "
-        f"{captured.get('max_in_progress_per_profile')!r}; fail closed"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# The operator's two deliberate escapes stay deliberate                       #
-# --------------------------------------------------------------------------- #
-
-def test_configured_cap_still_wins(isolated_kanban_home, monkeypatch):
-    """A configured cap is never overridden by the new default."""
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress_per_profile": 3}})
-    captured, _out = _dispatch_cli(monkeypatch)
-    assert captured.get("max_in_progress_per_profile") == 3
-
-
-def test_zero_stays_an_explicit_optout(isolated_kanban_home, monkeypatch):
-    """``max_in_progress_per_profile: 0`` means "no cap" and must keep meaning that."""
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress_per_profile": 0}})
-    captured, _out = _dispatch_cli(monkeypatch)
-    assert captured.get("max_in_progress_per_profile") is None
-
-
-def test_ignore_cap_bypasses_and_says_so(isolated_kanban_home, capped_env, monkeypatch):
-    """``--ignore-cap`` is the only way to start past the cap, and it announces itself."""
-    make_ready, spawned = capped_env
-    # No global cap in this config: the per-profile cap is then the ONLY thing that can
-    # stop these five, which is exactly what --ignore-cap gives up.
-    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
-    make_ready(5)
-    captured, out = _dispatch_cli(monkeypatch, args={"ignore_cap": True})
-    assert captured.get("max_in_progress_per_profile") is None, (
-        "--ignore-cap must actually lift the cap, or the flag is a lie"
-    )
-    assert len(spawned) == 5, f"--ignore-cap should start all five; started {len(spawned)}"
-    assert "ignore-cap" in out.lower(), (
-        "a deliberate bypass must be visible on stdout; the operator who wants one should "
-        "see what they gave up"
-    )
-
-
-def test_defaulted_cap_is_announced(isolated_kanban_home, monkeypatch):
-    """A defaulted cap is reported, so 'why did only one start' is answerable from the run."""
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    _captured, out = _dispatch_cli(monkeypatch)
-    assert "per-profile" in out.lower(), (
-        "the pass should state the per-profile cap it applied and that it was defaulted"
-    )
-
-
-# --------------------------------------------------------------------------- #
-# The sibling entry points (same class, same fix)                             #
-# --------------------------------------------------------------------------- #
-
-def test_standalone_daemon_tick_applies_the_per_profile_cap(isolated_kanban_home, monkeypatch):
-    """``run_daemon``'s own docstring: "the standalone daemon must not be the one uncapped
-    entry point." It currently passes no per-profile cap at all."""
+    from hermes_cli import kanban_db
     from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    # The daemon reads the cap through the read-only loader (as the gateway does); patch
-    # that one too, or the test would only be proving the fallback of an empty home.
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    captured: dict = {}
+    cfg = lambda: {"kanban": {"max_in_progress_per_profile": 3}}
+    monkeypatch.setattr("hermes_cli.config.load_config", cfg)
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", cfg)
+
+    daemon_kwargs: dict = {}
     monkeypatch.setattr(
         kbd, "dispatch_once",
-        lambda conn, **kw: (captured.update(kw), _empty_result(kbd))[1],
+        lambda conn, **kw: (daemon_kwargs.update(kw), kanban_db.DispatchResult())[1],
     )
     stop = threading.Event()
-
-    def on_tick(_res):
-        stop.set()
-
-    kbd.run_daemon(interval=0.05, stop_event=stop, on_tick=on_tick)
-    assert captured.get("max_in_progress_per_profile") == 1, (
-        "the daemon tick resolved no per-profile cap; it is the uncapped entry point its "
-        "docstring forbids"
+    kbd.run_daemon(interval=0.05, stop_event=stop, on_tick=lambda _res: stop.set())
+    assert daemon_kwargs.get("max_in_progress_per_profile") == 3, (
+        "the daemon tick ignored kanban.max_in_progress_per_profile; "
+        f"got {daemon_kwargs.get('max_in_progress_per_profile')!r}"
     )
 
-
-def _empty_result(kbd):
-    from hermes_cli import kanban_db
-    return kanban_db.DispatchResult()
-
-
-def test_dashboard_dispatch_nudge_applies_the_per_profile_cap(isolated_kanban_home, monkeypatch):
-    """``POST /dispatch`` is the same gesture as the CLI pass, one click away, default
-    ``max=8`` — and it passed no per-profile cap either."""
     pytest.importorskip("fastapi", reason="dashboard route needs fastapi")
-    from hermes_cli import kanban_db
     from plugins.kanban.dashboard import plugin_api as api
 
-    monkeypatch.setattr("hermes_cli.config.load_config",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly",
-                        lambda: {"kanban": {"max_in_progress": 4}})
-    captured: dict = {}
+    nudge_kwargs: dict = {}
     monkeypatch.setattr(
         api.kbd, "dispatch_once",
-        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+        lambda conn, **kw: (nudge_kwargs.update(kw), kanban_db.DispatchResult())[1],
     )
 
     @contextlib.contextmanager
@@ -263,7 +159,78 @@ def test_dashboard_dispatch_nudge_applies_the_per_profile_cap(isolated_kanban_ho
 
     monkeypatch.setattr(api, "_board_conn", fake_board_conn)
     api.dispatch(dry_run=True, max_n=8, board=None)
-    assert captured.get("max_in_progress_per_profile") == 1, (
-        "the dashboard nudge must respect the same per-profile cap as every other path; "
-        f"got {captured.get('max_in_progress_per_profile')!r}"
+    assert nudge_kwargs.get("max_in_progress_per_profile") == 3, (
+        "the dashboard nudge ignored the per-profile cap; "
+        f"got {nudge_kwargs.get('max_in_progress_per_profile')!r}"
+    )
+
+
+def test_unset_key_stays_unlimited_on_every_path(isolated_kanban_home, monkeypatch):
+    """No cap configured ⇒ unlimited, on the CLI too. That is the documented default.
+
+    Guard against the tempting wrong fix: defaulting the forced path alone to something
+    conservative would make the CLI and the gateway disagree about one key, which is the
+    very defect being fixed here.
+    """
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    _rc, captured, out = _dispatch_cli(monkeypatch)
+    assert captured.get("max_in_progress_per_profile") is None
+    assert "unlimited" in out.lower(), (
+        "an unlimited pass should say so, so the operator can tell 'no cap configured' "
+        "from 'the cap said stop'"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# A config that cannot be read stops the pass                                 #
+# --------------------------------------------------------------------------- #
+
+def test_unreadable_config_refuses_the_pass_instead_of_unlocking_it(isolated_kanban_home,
+                                                                  capped_env, monkeypatch):
+    """The whole config read sat in one ``except Exception`` that nulled every cap and
+    dispatched anyway. A broken config must not be able to mean "spawn the queue"."""
+    make_ready, spawned = capped_env
+
+    def boom():
+        raise RuntimeError("config.yaml is unparseable")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", boom)
+    make_ready(5)
+    rc, captured, _out = _dispatch_cli(monkeypatch)
+    assert captured == {}, (
+        "dispatch_once ran with an unreadable config; the pass should refuse before it "
+        "opens the board"
+    )
+    assert spawned == [], f"a pass that could not read its config started {len(spawned)} workers"
+    assert rc != 0, "refusing to dispatch must be visible in the exit code, not just stderr"
+
+
+# --------------------------------------------------------------------------- #
+# What the operator sees                                                      #
+# --------------------------------------------------------------------------- #
+
+def test_zero_stays_an_explicit_optout(isolated_kanban_home, monkeypatch):
+    """``max_in_progress_per_profile: 0`` means "no cap" and must keep meaning that."""
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"kanban": {"max_in_progress_per_profile": 0}})
+    _rc, captured, out = _dispatch_cli(monkeypatch)
+    assert captured.get("max_in_progress_per_profile") is None
+    assert "unlimited" in out.lower()
+
+
+def test_the_pass_names_the_cap_it_ran_under(isolated_kanban_home, monkeypatch):
+    """A configured cap is reported as a number and attributed to its key, in text and JSON."""
+    monkeypatch.setattr("hermes_cli.config.load_config",
+                        lambda: {"kanban": {"max_in_progress_per_profile": 3}})
+    _rc, _captured, out = _dispatch_cli(monkeypatch)
+    assert "per-profile cap: 3" in out.lower(), out
+
+    import json
+
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    _rc, _c, out_json = _dispatch_cli(monkeypatch, args={"json": True})
+    payload = json.loads(out_json)
+    assert payload["per_profile_cap"] is None
+    assert payload["per_profile_cap_source"] == "unset", (
+        "--json should distinguish 'unset' from 'opted-out' from a configured number"
     )
