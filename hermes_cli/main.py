@@ -307,6 +307,7 @@ from hermes_cli.subcommands.connectors import build_connectors_parser
 from hermes_cli.subcommands.vault import build_vault_parser
 from hermes_cli.subcommands.moa import build_moa_parser
 from hermes_cli.subcommands.fallback import build_fallback_parser
+from hermes_cli.subcommands.providers import build_providers_parser
 from hermes_cli.subcommands.worktree import build_worktree_parser
 from hermes_cli.subcommands.browser import build_browser_parser
 from hermes_cli.subcommands.secrets import build_secrets_parser
@@ -3078,15 +3079,13 @@ def _build_cli_parser():
     chat_parser.set_defaults(func=cmd_chat)
 
     build_model_parser(subparsers, cmd_model=cmd_model)
-    build_moa_parser(subparsers)
-    build_fallback_parser(subparsers)
-    build_worktree_parser(subparsers)
-    build_browser_parser(subparsers)
-    build_secrets_parser(subparsers)
-    # OUTBOUND egress firewall; ``hermes proxy`` (gateway group) is the INBOUND one.
-    build_egress_parser(subparsers)
-    build_migrate_parser(subparsers)
-    build_codex_runtime_parser(subparsers)
+    # The single-argument registrations, in ``--help`` order. Each builder lives beside its command
+    # in hermes_cli/subcommands/. ``egress`` is the OUTBOUND iron-proxy firewall; ``hermes proxy``
+    # (the gateway group) is the INBOUND one.
+    for _register in (build_moa_parser, build_fallback_parser, build_providers_parser,
+                      build_worktree_parser, build_browser_parser, build_secrets_parser,
+                      build_egress_parser, build_migrate_parser, build_codex_runtime_parser):
+        _register(subparsers)
     build_gateway_parser(
         subparsers, cmd_gateway=cmd_gateway, cmd_proxy=cmd_proxy, cmd_gateway_enroll=cmd_gateway_enroll
     )

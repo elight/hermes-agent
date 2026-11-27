@@ -305,6 +305,9 @@ FAILURE_CAUSE_GLOSS: dict[str, str] = {
     FailoverReason.auth.value: "the AI model service rejected the sign-in",
     FailoverReason.auth_permanent.value: "the AI model service rejected the sign-in",
     FailoverReason.upstream_blocked.value: "a firewall/CDN in front of the AI model service blocked the request",
+    FailoverReason.provider_path_locked.value: (
+        "every AI model service it could use is locked out until someone reopens one"
+    ),
     FailoverReason.guardrail_blocked.value: "the AI model service's prompt-injection guardrail rejected the request",
     FailoverReason.model_not_found.value: "the model {subject} uses was not found at the AI model service",
     FailoverReason.content_policy_blocked.value: "the AI model service's safety filter rejected the request",
@@ -531,11 +534,26 @@ def relogin_command_hint(provider: Any) -> str:
     return f"hermes {profile_cli_selector()}auth add {slug}"
 
 
+def _provider_path_locked_copy(*, label: str) -> str:
+    """The terminal sentence for a turn whose every available path is locked.
+
+    The wording lives with the lock (``agent.provider_locks``): it names each closed path and why,
+    says the closure was deliberate rather than an outage to ride out, and gives the exact command
+    that reopens one. Nothing here appends the provider's words — the provider did not write this
+    decision, this host did. If a path reopened itself between the refusal and here, the generic
+    line is the honest one."""
+    from agent.provider_locks import all_paths_locked_copy, list_locks
+    return all_paths_locked_copy(list_locks()) or _NONRETRYABLE_DEFAULT_COPY.format(
+        label=label, home=display_hermes_home())
+
+
 def nonretryable_copy(
     classified: Any, *, provider: Any, model: Any, summary: str, prefix_suggestion: Optional[str] = None,
 ) -> str:
     """Chat copy for a terminal non-retryable rejection (auth, model missing, TLS, generic 4xx)."""
     label = provider_label_for(provider)
+    if getattr(classified, "reason", None) is FailoverReason.provider_path_locked:
+        return _provider_path_locked_copy(label=label)
     if getattr(classified, "is_auth", False):
         from agent.error_surface import auth_kind
 

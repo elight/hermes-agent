@@ -15,6 +15,7 @@ import time
 from typing import Any, Dict, Optional
 
 from agent.error_classifier import FailoverReason
+from agent import provider_locks
 from agent.agent_runtime_helpers_placeholders import hidden_interrupt_placeholder_row
 from agent.message_metadata import append_message
 from agent.repetition_guard import REPETITION_LOOP_INTERRUPTED, is_runaway_repetition
@@ -76,6 +77,12 @@ def perform_api_call(
     interrupted: Any,
 ) -> ApiCallVerdict:
     """Issue the request (see ``_should_stream`` for the streaming decision)."""
+    # A locked egress path is refused HERE, in the process that would dial, before a request is
+    # built or sent. Serve is deliberately not the enforcer: on 2026-11-20 serve was the sick
+    # component while healthy backends hammered the dead path. The raise classifies as provider
+    # unavailability, so the caller's existing fallback chain takes the turn — and a fallback
+    # model on the same locked path meets the same check on its own dial.
+    provider_locks.dial(getattr(agent, "provider", "") or "", component="agent-loop")
     response = None
 
     def _verdict(action: str) -> ApiCallVerdict:

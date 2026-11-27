@@ -1014,6 +1014,8 @@ _NONRETRYABLE_LABELS = {
     FailoverReason.ssl_cert_verification: "The provider's security certificate could not be verified",
     # Only reached after the one-shot image shrink ran (recover_after_classification sets the flag first).
     FailoverReason.image_too_large: "Request still exceeded the provider's size limit after shrinking images",
+    # The lock is this host's own decision, so the label says so instead of blaming a provider.
+    FailoverReason.provider_path_locked: "Provider path locked until cleared",
 }
 
 
