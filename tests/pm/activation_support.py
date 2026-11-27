@@ -156,6 +156,27 @@ def fake_store(tmp_path: Path) -> tuple[Path, Path]:
     return store, entry
 
 
+def venv_entry(store: Path, name: str) -> Path:
+    """A store entry with a real spawnable interpreter, laid out like a
+    uv-managed install: ``python.exe`` at the entry root next to its
+    ``pyvenv.cfg`` (what activate.ps1's ``python-*`` glob and root-level
+    candidate look for). A copied CPython binary would miss its DLLs and
+    stdlib; the venv redirector does not — it reads the adjacent
+    ``pyvenv.cfg`` and resolves the base install through its ``home`` key.
+    Windows-only layout (``Scripts``), so only platforms("windows") tests
+    may call this."""
+    venv = store.parent / f"{name}-venv"
+    subprocess.run(
+        [str(spawnable_python()), "-m", "venv", "--without-pip", str(venv)],
+        check=True, capture_output=True, env=child_env(), timeout=120,
+    )
+    entry = store / name
+    entry.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(venv / "Scripts" / "python.exe", entry / "python.exe")
+    shutil.copy2(venv / "pyvenv.cfg", entry / "pyvenv.cfg")
+    return entry
+
+
 def isolated_checkout(tmp_path: Path) -> Path:
     root = tmp_path / "checkout with spaces"
     root.mkdir()

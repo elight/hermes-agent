@@ -15,6 +15,7 @@ import pytest
 from tests.pm.activation_support import (
     ACTIVATE, ACTIVATE_PS1, CANARY, SETUP_HERMES_PS1, SETUP_HERMES_SH, bash, bash_env,
     child_env, fake_store, isolated_checkout, posix, powershell, spawnable_python,
+    venv_entry,
 )
 
 
@@ -194,3 +195,129 @@ def test_powershell_activate_exports_and_deactivates(tmp_path: Path):
     # Nothing is committed, so the checkout alone: the bootstrap .venv's packages never leak in.
     assert f"active={root}\n" in result.stdout
     assert "after=caller-original" in result.stdout
+
+
+# --- bootstrap Python account-store fallback (Windows) ---------------------
+#
+# A profile shell (HERMES_HOME=profiles/<name>) with no tools of its own must
+# resolve the bootstrap interpreter from the account store, after the profile's
+# own tools rung misses — the same search order as scripts/_activation.sh.
+# Regression for the profile-shell breakage where activation refused with
+# "no bootstrap Python found" although the account store held the interpreter.
+
+def _profile_shell_env(tmp_path: Path, *, hermes_home: Path | None,
+                       localappdata: Path) -> dict:
+    """Env for a shell that starts unprovisioned everywhere: HOME-ish at
+    tmp_path, HERMES_HOME optionally set (unset models the default install),
+    LOCALAPPDATA the account root the fallback resolves. No runtime dir, no
+    Python vars."""
+    env = child_env()
+    home = tmp_path / "profile-home"
+    home.mkdir(exist_ok=True)
+    env.update(HOME=posix(home), USERPROFILE=str(home))
+    if hermes_home is not None:
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        env["HERMES_HOME"] = posix(hermes_home)
+    else:
+        env.pop("HERMES_HOME", None)
+    env["LOCALAPPDATA"] = str(localappdata)
+    for key in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "BASH_ENV",
+                "__HERMES_ACTIVATED", "HERMES_RUNTIME_DIR", CANARY):
+        env.pop(key, None)
+    return env
+
+
+def _source_activate(ps: str, script: Path, env: dict, cwd: Path):
+    return subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+         f"$ErrorActionPreference='Stop'; . '{script}'; "
+         "Write-Output ('sentinel-file=' + [bool](Test-Path $env:__HERMES_ACTIVATED))"],
+        capture_output=True, text=True, cwd=str(cwd), env=env, timeout=60, check=False,
+    )
+
+
+@pytest.mark.platforms("windows")
+def test_activate_falls_back_to_the_account_store_from_a_profile_shell(tmp_path: Path):
+    """The bug: a profile's HERMES_HOME has no tools dir; the interpreter is
+    the account store's. On the base commit activation throws
+    "no bootstrap Python found" here — red on base, green with the fallback."""
+    root = isolated_checkout(tmp_path)
+    account = tmp_path / "AppData"
+    venv_entry(account / "hermes" / "tools", "python-3.11.9")
+    env = _profile_shell_env(tmp_path, hermes_home=tmp_path / "profile-home" / "hermes",
+                             localappdata=account)
+    ps = powershell()
+    assert ps, "native Windows test requires PowerShell"
+    result = _source_activate(ps, root / "activate.ps1", env, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "sentinel-file=True" in result.stdout, result.stdout + result.stderr
+
+
+def _activate_refusal(tmp_path: Path, env: dict) -> str:
+    """Source activate.ps1 in an unprovisioned world; return its failure text.
+    Whitespace-flattened: PowerShell word-wraps the ErrorRecord at the console
+    width, and these paths exceed it — a raw substring hit would be a
+    line-length coincidence, not an assertion about the message."""
+    root = isolated_checkout(tmp_path)
+    ps = powershell()
+    assert ps, "native Windows test requires PowerShell"
+    result = subprocess.run(
+        [ps, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+         f"$ErrorActionPreference='Stop'; . '{root / 'activate.ps1'}'"],
+        capture_output=True, text=True, cwd=str(tmp_path), env=env, timeout=60, check=False,
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    return " ".join((result.stdout + result.stderr).split())
+
+
+@pytest.mark.platforms("windows")
+def test_activate_missing_everywhere_names_every_searched_root(tmp_path: Path):
+    """Nothing provisioned anywhere: the refusal carries each root in search
+    order (checkout-adjacent, profile tools, account tools) plus the
+    remediation, so the user sees what to fix, not just that something is
+    missing."""
+    env = _profile_shell_env(tmp_path, hermes_home=tmp_path / "profile-home" / "hermes",
+                             localappdata=tmp_path / "AppData")
+    text = _activate_refusal(tmp_path, env)
+    # Roots are listed as searched — the checkout-adjacent rung is the raw
+    # "<checkout>\..\tools" string, not a normalized path.
+    repo_adjacent = str(tmp_path / "checkout with spaces" / ".." / "tools")
+    profile_tools = str(tmp_path / "profile-home" / "hermes" / "tools")
+    account_tools = str(tmp_path / "AppData" / "hermes" / "tools")
+    for path in (repo_adjacent, profile_tools, account_tools):
+        assert path in text, f"{path} missing from the refusal:\n{text}"
+    assert (text.index(repo_adjacent) < text.index(profile_tools)
+            < text.index(account_tools)), f"roots out of search order:\n{text}"
+    assert "run setup-hermes.ps1" in text, text
+
+
+@pytest.mark.platforms("windows")
+def test_default_home_searches_the_account_store_once(tmp_path: Path):
+    """Default install (HERMES_HOME unset): the default-home rung and the
+    account store are the same directory — the refusal must not name it
+    twice, so the list keeps describing distinct places actually searched."""
+    env = _profile_shell_env(tmp_path, hermes_home=None, localappdata=tmp_path / "AppData")
+    text = _activate_refusal(tmp_path, env)
+    account_tools = str(tmp_path / "AppData" / "hermes" / "tools")
+    assert account_tools in text, text
+    assert text.count(account_tools) == 1, f"account store listed twice:\n{text}"
+
+
+@pytest.mark.platforms("windows")
+def test_activate_prefers_a_profile_store_over_the_account_store(tmp_path: Path):
+    """Ordering invariant: the fallback goes AFTER the profile's own tools.
+    The account-store entry is a non-spawnable stub, so a resolver that
+    consulted it first could not complete activation with a clean sentinel."""
+    root = isolated_checkout(tmp_path)
+    account = tmp_path / "AppData"
+    stub = account / "hermes" / "tools" / "python-3.11.9"
+    stub.mkdir(parents=True)
+    (stub / "python.exe").write_text("not an interpreter", encoding="utf-8")
+    venv_entry(tmp_path / "profile-home" / "hermes" / "tools", "python-3.11.9")
+    env = _profile_shell_env(tmp_path, hermes_home=tmp_path / "profile-home" / "hermes",
+                             localappdata=account)
+    ps = powershell()
+    assert ps, "native Windows test requires PowerShell"
+    result = _source_activate(ps, root / "activate.ps1", env, tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "sentinel-file=True" in result.stdout, result.stdout + result.stderr
