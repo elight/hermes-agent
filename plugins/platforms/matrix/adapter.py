@@ -353,6 +353,12 @@ _STARTUP_GRACE_SECONDS = 5  # ignore messages older than this many seconds befor
 
 _OUTBOUND_MENTION_RE = re.compile(r"(?<![\w/])(@[0-9A-Za-z._=/-]+:[0-9A-Za-z.-]+(?::\d+)?)")
 
+# Bare handles (``@evan``) carry no domain, so they can only be resolved against the target
+# room's members. The lookbehind keeps e-mails and the inside of markdown link URLs out of
+# range; the lookahead excludes full MXIDs (already handled) and ``foo@bar``-style tails.
+_BARE_OUTBOUND_MENTION_RE = re.compile(r"(?<![\w/:#])@([0-9A-Za-z._=-]+)(?![\w:./-])")
+_BARE_MENTION_MEMBERS_TTL_SECONDS = 300.0
+
 _E2EE_INSTALL_HINT = "Install with: pip install 'mautrix[encryption]' asyncpg aiosqlite  (requires libolm C library)"
 
 _MATRIX_IMAGE_FILENAME_EXTS = frozenset({
@@ -727,6 +733,10 @@ class MatrixAdapter(BasePlatformAdapter):
         # If non-empty, bot ONLY responds in these rooms (whitelist); DMs exempt.
         self._allowed_rooms: set[str] = _extra_csv_set(config, "allowed_rooms", "MATRIX_ALLOWED_ROOMS")
         self._allow_room_mentions: bool = _env_truthy("MATRIX_ALLOW_ROOM_MENTIONS", "false")
+        # Bare-handle mention resolution: per-room member cache (MSC3952 mentions need full MXIDs).
+        self._bare_mention_members: dict[str, dict[str, "float | dict[str, list[str]]"]] = {}
+        self._bare_mention_members_ttl_seconds = _env_number(
+            "MATRIX_BARE_MENTION_TTL_SECONDS", _BARE_MENTION_MEMBERS_TTL_SECONDS, float)
         # Extra-first: the YAML bridge seeds these into extra and skips the env write under a
         # multiplexed secondary scope, where os.environ holds the DEFAULT profile's flags.
         self._auto_thread: bool = self._extra_truthy(config, "auto_thread", "MATRIX_AUTO_THREAD", "true")
@@ -1255,6 +1265,7 @@ class MatrixAdapter(BasePlatformAdapter):
         for chunk in self.truncate_message(
                 self.format_message(content), self.max_message_length, len_fn=self.message_len_fn):
             msg_content = self._build_text_message_content(chunk)
+            await self._resolve_bare_mentions(chat_id, msg_content, chunk)
             self._apply_relation_metadata(msg_content, reply_to=reply_to, metadata=metadata)
             try:
                 last_event_id = await self._send_room_message(chat_id, msg_content)
@@ -1339,6 +1350,7 @@ class MatrixAdapter(BasePlatformAdapter):
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         formatted = self.format_message(content)
         new_content = self._build_text_message_content(formatted)
+        await self._resolve_bare_mentions(chat_id, new_content, formatted)
         msg_content: dict[str, Any] = {"msgtype": "m.text", "body": f"* {formatted}", "m.new_content": new_content}
         if "m.mentions" in new_content:
             msg_content["m.mentions"] = new_content["m.mentions"]
@@ -2783,6 +2795,91 @@ class MatrixAdapter(BasePlatformAdapter):
         """Return True when outbound text contains @room outside protected spans."""
         protected, _ = self._protect_outbound_mention_regions(text)
         return bool(re.search(r"(?<![\w/])@room(?![\w:.-])", protected))
+
+    def _bare_mention_handles(self, text: str) -> list[str]:
+        """Bare ``@handle`` localparts in *text*, outside code spans and existing links.
+
+        ``room`` is excluded: it belongs to the separately gated ``@room`` room-mention,
+        never to per-user resolution.
+        """
+        protected, _ = self._protect_outbound_mention_regions(text)
+        return [h for h in dict.fromkeys(_BARE_OUTBOUND_MENTION_RE.findall(protected))
+                if h.lower() != "room"]
+
+    async def _room_members_by_localpart(self, room_id: str) -> dict[str, list[str]]:
+        """Cached localpart → MXIDs for *room_id* (TTL; stale cache kept on API failure)."""
+        cached = self._bare_mention_members.get(room_id)
+        cached_map: dict[str, list[str]] = dict((cached or {}).get("by_localpart", {}))  # type: ignore[arg-type]
+        if cached and time.monotonic() - float(cached["ts"]) < self._bare_mention_members_ttl_seconds:  # type: ignore[arg-type]
+            return cached_map
+        by_localpart: dict[str, list[str]] = {}
+        fetched = False
+        client = getattr(self, "_client", None)
+        if client is not None and hasattr(client, "joined_members"):
+            try:
+                resp = await client.joined_members(room_id)
+                fetched = True
+            except Exception:
+                resp = None
+            for mxid in (getattr(resp, "members", None) or {}) if fetched else ():
+                localpart, sep, _domain = str(mxid)[1:].partition(":")
+                if sep and mxid != self._user_id and mxid != getattr(client, "mxid", None):
+                    by_localpart.setdefault(localpart.lower(), []).append(str(mxid))
+        # Never negative-cache a failed first fetch: a transient API error must not suppress
+        # mentions for the whole TTL once the endpoint recovers. A successful fetch that finds
+        # no other members IS cached (empty map).
+        if fetched:
+            if len(self._bare_mention_members) > 256:  # opportunistic cap; rooms rarely churn
+                now = time.monotonic()
+                for rid in [k for k, v in self._bare_mention_members.items()
+                            if now - float(v["ts"]) >= self._bare_mention_members_ttl_seconds]:
+                    self._bare_mention_members.pop(rid, None)
+            self._bare_mention_members[room_id] = {"ts": time.monotonic(), "by_localpart": by_localpart}
+            return by_localpart
+        return cached_map
+
+    async def _resolve_bare_mentions(self, chat_id: str, msg_content: dict[str, Any], text: str) -> None:
+        """Turn bare ``@handle`` text into real mentions (MSC3952 ``m.mentions`` + pill link).
+
+        Clients and push rules only notify on ``m.mentions.user_ids`` (or a legacy matrix.to
+        link); literal ``@name`` text never pings anyone. A bare handle resolves only when it
+        matches exactly one *joined* member of the target room (never the sender), so a typo
+        or a member-less handle stays literal text instead of firing a bogus notification.
+        """
+        handles = self._bare_mention_handles(text)
+        if not handles:
+            return
+        by_localpart = await self._room_members_by_localpart(chat_id)
+        resolved: dict[str, str] = {}
+        for handle in handles:
+            candidates = by_localpart.get(handle.lower(), [])
+            if len(candidates) == 1:
+                resolved[handle.lower()] = candidates[0]
+        if not resolved:
+            return
+        ids = msg_content.setdefault("m.mentions", {}).setdefault("user_ids", [])
+        for mxid in dict.fromkeys(resolved.values()):
+            if mxid not in ids:
+                ids.append(mxid)
+        # Rewrite only OUTSIDE protected spans: the same handle may also appear inside a code
+        # span or link URL, and that occurrence must stay literal (substitute on the masked
+        # text, then restore the placeholders verbatim).
+        protected, placeholders = self._protect_outbound_mention_regions(text)
+        linked = _BARE_OUTBOUND_MENTION_RE.sub(
+            lambda m: f"[{m.group(0)}](https://matrix.to/#/{resolved[m.group(1).lower()]})"
+            if m.group(1).lower() in resolved else m.group(0), protected)
+        for idx, original in enumerate(placeholders):
+            linked = linked.replace(f"\x00MENTION_PROTECTED{idx}\x00", original)
+        if linked != text:
+            msg_content["body"] = linked
+            html = self._markdown_to_html(self._inject_outbound_mention_links(linked))
+            if html and html != linked and _content_bytes({**msg_content, "format": "org.matrix.custom.html", "formatted_body": html}) <= _MAX_CONTENT_BYTES:
+                msg_content["format"] = "org.matrix.custom.html"
+                msg_content["formatted_body"] = html
+            elif "formatted_body" in msg_content:
+                # Body changed but new HTML doesn't fit: drop the stale pre-rewrite HTML so
+                # clients never render a formatted_body that contradicts the plain body.
+                del msg_content["format"], msg_content["formatted_body"]
 
     def _inject_outbound_mention_links(self, text: str) -> str:
         """Wrap outbound Matrix mentions in markdown links outside code spans."""
