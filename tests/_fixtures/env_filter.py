@@ -330,3 +330,35 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "DINGTALK_REQUIRE_MENTION",
     "MATRIX_REQUIRE_MENTION",
 })
+
+
+# ── Supervisor unit-membership markers ─────────────────────────────────────
+#
+# systemd stamps these into EVERY process of a unit; any shell hosted by a
+# service (a dispatcher-spawned Hermes worker, a cron unit, a systemd CI
+# runner) passes them down. Production spawn-topology code reads them for
+# exactly that meaning: ``tools.process_registry.restart_safe_gateway_child_argv``
+# gates on ``INVOCATION_ID`` — under a managed unit a Kanban worker spawn
+# (``outlives_parent=True``) must be wrapped in a restart-safe scope, and the
+# dispatcher refuses (raises "no current run id") when the claimed Task has no
+# run to trace the scope to. That guard is correct — the pytest process is
+# simply never the supervised gateway it would assume. Left ambient, it killed
+# every default-spawn test that builds a run-id-less Task fixture: four deterministic
+# failures on a systemd-hosted shell, green everywhere else (CI's clean env,
+# macOS) — the classic red-locally-green-on-CI shape. The suite must assert the
+# ordinary non-systemd topology by default; tests simulating a systemd host
+# setenv explicitly (``tests/e2e/test_platform_commands.py``,
+# ``tests/gateway/test_systemd_notify.py``), which an autouse fixture strips
+# first. ``INVOCATION_ID`` alone is the proven trigger; the rest of the
+# unit-membership class ships so sibling detection paths (shutdown forensics,
+# sd_notify feeding) inherit the same hermetic contract, mirroring the
+# systemd subset of production's ``SUPERVISOR_MARKER_ENV``
+# (``hermes_cli/gateway_runtime_start.py``).
+_SUPERVISOR_UNIT_VARS = frozenset({
+    "INVOCATION_ID",
+    "JOURNAL_STREAM",
+    "SYSTEMD_EXEC_PID",
+    "NOTIFY_SOCKET",
+    "WATCHDOG_USEC",
+    "WATCHDOG_PID",
+})

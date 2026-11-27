@@ -259,7 +259,11 @@ if not HOST_LOCK_DIR_AT_CONFTEST_IMPORT:
 # conftest (that is the repo root), and pytest fails a run that loads a
 # non-root conftest carrying ``pytest_plugins`` after startup (e.g. ``pytest .``).
 # Fixtures imported here register exactly as if they were defined here.
-from tests._fixtures.env_filter import _HERMES_BEHAVIORAL_VARS, _looks_like_credential
+from tests._fixtures.env_filter import (
+    _HERMES_BEHAVIORAL_VARS,
+    _SUPERVISOR_UNIT_VARS,
+    _looks_like_credential,
+)
 from tests._fixtures.live_system_guard import (
     _GATEWAY_LOOKALIKE_MARK,
     _LIVE_SYSTEM_GUARD_BYPASS_MARK,
@@ -286,6 +290,16 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
 
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
+        monkeypatch.delenv(name, raising=False)
+
+    # 2b. Blank supervisor unit-membership markers (systemd's INVOCATION_ID
+    #     et al.). A test run hosted by a service unit -- dispatcher-spawned
+    #     workers, cron units, systemd CI runners -- would otherwise inherit
+    #     "this process lives in a managed unit" and flip production spawn
+    #     topology (restart_safe_gateway_child_argv refuses in-process Kanban
+    #     children there). Tests that need a systemd host setenv these
+    #     themselves; this fixture runs first, so they still win.
+    for name in _SUPERVISOR_UNIT_VARS:
         monkeypatch.delenv(name, raising=False)
 
     # Honcho's fallback host/config resolution legitimately reads the user's
