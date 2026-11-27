@@ -11,9 +11,6 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(dirname "$here")"
 # shellcheck source=scripts/_activation.sh
 . "$here/_activation.sh"
-python="$(hermes_bootstrap_python "$repo")" || {
-    echo "no bootstrap Python found; run setup-hermes.sh" >&2
-    exit 1
-}
+python="$(hermes_bootstrap_python "$repo")" || exit 1
 (cd "$repo" && PYTHONHOME= PYTHONPATH="$repo" "$python" -m pm.cli lock)
 exec "$here/run-in-hermes-env" true

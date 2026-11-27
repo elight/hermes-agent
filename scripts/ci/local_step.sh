@@ -16,10 +16,7 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck source=scripts/_activation.sh
 . "$repo/scripts/_activation.sh"
-python="$(hermes_bootstrap_python "$repo")" || {
-    echo "no bootstrap Python found; run setup-hermes.sh" >&2
-    exit 1
-}
+python="$(hermes_bootstrap_python "$repo")" || exit 1
 bin="${python%[/\\]*}"
 if command -v cygpath >/dev/null 2>&1; then bin="$(cygpath -u "$bin")"; fi
 # verify_uv_lock.py runs `python -m pm.build_env`, as setup-pm's toolchain Python.
