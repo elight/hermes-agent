@@ -1292,11 +1292,14 @@ Instead of the in-app setting, you can point the desktop at a backend with an en
 |---------|-------|
 | `HERMES_DESKTOP_REMOTE_URL` | `http://<backend-host>:9119` |
 
+Leave `HERMES_DESKTOP_REMOTE_TOKEN` **unset** here. It is a separate opt-in that pins token auth instead of signing in, and only a backend started with `HERMES_DASHBOARD_SESSION_TOKEN` accepts it — see [`HERMES_DESKTOP_REMOTE_TOKEN`](../reference/environment-variables.md#web-dashboard--hermes-desktop).
+
 ### Troubleshooting
 
 - **"Remote gateway incomplete"** — you haven't entered a remote URL.
 - **Sign-in fails with 401 / "Invalid credentials"** — the username or password doesn't match the backend's `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` / `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD`. The backend returns the same generic error for unknown user and wrong password, so check both. Confirm the gate with `curl -s http://<host>:9119/api/status | jq '.auth_required, .auth_providers'` — it should report `true` and include `"basic"`.
 - **No "Sign in" button — it asks for a session token instead** — the username/password provider isn't active (`/api/status` won't list `"basic"`). Make sure the username and a password (or password hash) are set and the dashboard process loaded them.
+- **Signed in fine, but every request still comes back 401** — `HERMES_DESKTOP_REMOTE_TOKEN` is set in the environment. That pins the app to token auth, which this backend accepts only when it was started with `HERMES_DASHBOARD_SESSION_TOKEN`, so the token you pass can never match. Unset the variable; the app then uses the session you signed in with.
 - **Signed out on every restart** — set `HERMES_DASHBOARD_BASIC_AUTH_SECRET` to a stable value; otherwise the signing key is regenerated per boot.
 - **Connection refused / times out** — the backend bound to `127.0.0.1` (the default) instead of a reachable address, or a firewall/VPN is blocking the port. Bind to `0.0.0.0` or the tailscale IP and open the port to your trusted network.
 
