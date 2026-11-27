@@ -35,6 +35,16 @@ if (-not $py) {
     $roots = @($env:HERMES_RUNTIME_DIR, "$repo\..\tools")
     $homeRoot = if ($env:HERMES_HOME) { $env:HERMES_HOME } else { "$env:LOCALAPPDATA\hermes" }
     $roots += (Join-Path $homeRoot 'tools')
+    # A profile shell's HERMES_HOME holds no tools until `hermes pm install`
+    # provisions them; the account store holds the bootstrap the installer
+    # laid down. Search order matches scripts/_activation.sh (a profile-
+    # provisioned store stays authoritative), and building $accountStore from
+    # the default-home expression makes the -ne guard drop it when it already
+    # is the previous rung -- a default install searches it once.
+    # >>> bootstrap-account-store-fallback (lift-tested: tests/scripts/test_ps1_bootstrap_fallback_lift.py)
+    $accountStore = if ($env:LOCALAPPDATA) { "$env:LOCALAPPDATA\hermes\tools" } else { $null }
+    if ($accountStore -and (($accountStore -replace '[\\/]+$', '') -ne ($roots[-1] -replace '[\\/]+$', ''))) { $roots += $accountStore }
+    # <<< bootstrap-account-store-fallback
     foreach ($root in $roots) {
         if (-not $root) { continue }
         foreach ($entry in @(Get-ChildItem -LiteralPath $root -Directory -Filter 'python-*' -ErrorAction SilentlyContinue)) {
@@ -44,7 +54,12 @@ if (-not $py) {
         if ($py) { break }
     }
 }
-if (-not $py) { throw 'activate: no bootstrap Python found; run setup-hermes.ps1' }
+if (-not $py) {
+    # >>> bootstrap-miss-report (lift-tested: tests/scripts/test_ps1_bootstrap_fallback_lift.py)
+    $looked = ($roots | Where-Object { $_ }) -join '; '
+    throw "activate: no bootstrap Python found; searched: $looked (run setup-hermes.ps1)"
+    # <<< bootstrap-miss-report
+}
 $priorPath = $env:PYTHONPATH
 $priorHome = $env:PYTHONHOME
 try {
