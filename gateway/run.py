@@ -46,6 +46,9 @@ from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
 from gateway.run_common import _csv_or_list_to_set
+# Cron-silence announces: the gate hook fires on the ticker thread, the chore on housekeeping
+# (gateway/run_cron_liveness.py; stdlib-only at import time, no cycle with this facade).
+from gateway.run_cron_liveness import cron_liveness_chore, note_cron_gate
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 
@@ -1670,6 +1673,10 @@ def _cron_profile_gate(name: str, home: Path) -> bool:
     launch home's ``gateway.pid`` and publishes every served profile in ``served_profiles``, so a
     bare ``_check_gateway_running`` reports "running" for every home we serve — standing us down
     from all of them and stopping cron host-wide.
+
+    Every decision is announced once per (home, episode) by ``run_cron_liveness.note_cron_gate``:
+    the 2026-11-20 host-wide stand-down this docstring warns about was invisible because the gate
+    answered silently across five successive gateway processes.
     """
     from gateway.status import get_running_pid, resolve_gateway_liveness
 
@@ -1680,7 +1687,9 @@ def _cron_profile_gate(name: str, home: Path) -> bool:
     except Exception as exc:
         logger.debug("Cron profile gate probe failed for %s (ticking it): %s", name, exc)
         return True
-    return not (liveness.running and liveness.pid is not None and liveness.pid != os.getpid())
+    rejected = bool(liveness.running and liveness.pid is not None and liveness.pid != os.getpid())
+    note_cron_gate(name, rejected, source=liveness.source, rival_pid=liveness.pid)
+    return not rejected
 
 
 def _enable_multiplex_log_routing(config: object) -> bool:
@@ -4414,6 +4423,14 @@ def _start_gateway_housekeeping(
         # The ticker's own guards keep its loop alive; this is the outer layer for a thread that has
         # already ended (#111010). Runs every tick so the outage is bounded by one housekeeping interval.
         chores.append((1, "Cron ticker supervisor", cron_thread.restart_if_dead))
+        from cron.scheduler_provider import InProcessCronScheduler
+        if isinstance(cron_provider, InProcessCronScheduler):
+            # Heartbeat-age silence announce + gate/roster stand-down context + traceback-dump arming.
+            # Housekeeping is a SEPARATE thread, so it speaks even when the ticker itself is wedged —
+            # the Nov-20 host-wide stall wrote zero log lines. In-process only: an external provider
+            # never writes the local ``ticker_heartbeat``, so silence there is normal, not a stall.
+            chores.append((1, "Cron silence announcer",
+                           lambda: cron_liveness_chore(runner, cron_thread)))
     chores += [
         # Per served profile: each has its own skills tree, curator state, Nous login and state.db.
         (60, "Curator tick", profile_scoped_chore(runner, lambda: _housekeeping_curator(idle_fence))),
