@@ -32,18 +32,36 @@ hermes_sync() {
 
 # hermes_bootstrap_python REPO: print the interpreter that can run pm before
 # any dependency is importable. It only emits the environment; it installs nothing.
+# The account's own store ($HOME/.hermes/tools) is the last rung: a dispatcher
+# worker's shell carries HERMES_HOME as a profile that holds no store of its
+# own, and the account's interpreter, installed underneath it, is still there.
+# When every rung misses, the failure names every path it searched, in order;
+# "run setup-hermes.sh" alone sent two workers digging for an hour.
 hermes_bootstrap_python() {
-    local repo="$1" store candidate
+    local repo="$1" store candidate searched="" previous="" home_store
+    home_store="${HERMES_HOME:-$HOME/.hermes}"
+    home_store="${home_store%/}"
     for candidate in "$repo/.venv/bin/python" "$repo/.venv/Scripts/python.exe" \
                      "$repo/venv/bin/python" "$repo/venv/Scripts/python.exe"; do
+        searched+="$candidate"$'\n'
         [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
     done
-    for store in "${HERMES_RUNTIME_DIR:-}" "$repo/../tools" "${HERMES_HOME:-$HOME/.hermes}/tools"; do
+    # A store equal to the one searched just before is searched once, so an
+    # unset or default HERMES_HOME never probes $HOME/.hermes/tools twice.
+    for store in "${HERMES_RUNTIME_DIR:-}" "$repo/../tools" "$home_store/tools" "$HOME/.hermes/tools"; do
         [ -n "$store" ] || continue
+        [ "$store" != "$previous" ] || continue
+        previous="$store"
         for candidate in "$store"/python-*/bin/python3 "$store"/python-*/python.exe \
                          "$store"/python-*/bin/python "$store"/python-*/bin/python.exe; do
+            searched+="$candidate"$'\n'
             [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
         done
+    done
+    printf '%s\n' "no bootstrap Python found; run setup-hermes.sh" >&2
+    printf '%s\n' "searched, in order:" >&2
+    printf '%s' "$searched" | while IFS= read -r candidate; do
+        printf '  %s\n' "$candidate" >&2
     done
     return 1
 }
@@ -52,10 +70,7 @@ hermes_bootstrap_python() {
 # as a script for a shell of DIALECT (`sh` or `fish`).
 hermes_compose_env() {
     local repo="$1" dialect="$2" python script
-    python="$(hermes_bootstrap_python "$repo")" || {
-        echo "no bootstrap Python found; run setup-hermes.sh" >&2
-        return 1
-    }
+    python="$(hermes_bootstrap_python "$repo")" || return 1
     script="$(PYTHONHOME= PYTHONPATH="$repo" "$python" -m pm.environments --format "$dialect")" &&
         [ -n "$script" ] || {
         echo "could not read pm env (run ./setup-hermes.sh first)" >&2
