@@ -573,6 +573,91 @@ def test_active_pr_guard_holds_through_same_profile_reassign_and_unassign(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_active_pr_guard_lifts_on_same_second_changes_requested(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """review -> changes_requested -> ready must survive same-second writes.
+
+    t_b13a4839, proven live: the reviewer's findings comment quotes the PR URL
+    and ``request_changes`` writes its ``changes_requested`` event the same
+    second (timestamps are second-granularity). The old strict-after lift could
+    not order the two, so the card stayed ``active_pr`` forever and the whole
+    review loop deadlocked (6/6 island cards + gpud t_50117016). The reviewer's
+    handoff is exactly the event meant to re-enter the loop — it lifts on a tie.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="review loop", assignee="dev")
+        claim = kb.claim_task(conn, tid)
+        assert claim is not None
+        kb.add_comment(conn, tid, author="dev",
+                       body="Opened https://github.com/example/repo/pull/4521 for review.")
+        assert kb.request_review(
+            conn, tid, summary="PR up", reviewer="reviewer",
+            expected_run_id=claim.current_run_id,
+        )
+        review = kb.claim_review_task(conn, tid)
+        assert review is not None
+        # The reviewer's voice, same second by construction: a findings
+        # comment quoting the PR (what kanban_comment writes), then the
+        # changes_requested handoff.
+        kb.add_comment(conn, tid, author="reviewer",
+                       body="Fix both defects in https://github.com/example/repo/pull/4521.")
+        assert kb.request_changes(
+            conn, tid, reason="two defects", expected_run_id=review.current_run_id,
+        ) == (True, "dev")
+        assert kb.get_task(conn, tid).status == "ready"
+
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+
+
+def test_active_pr_guard_lifts_on_same_second_review_reopened(
+    kanban_home: Path,
+) -> None:
+    """The operator ``reopen --reason`` writes its comment beside the event.
+
+    ``_cmd_reopen_review`` appends the CHANGES-REQUESTED reason comment (which
+    quotes the PR) in the same second as ``review_reopened``; an operator
+    pulling the card back out of review is an explicit handoff and must lift
+    the guard on a tie, exactly like ``changes_requested``.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="reopen loop", assignee="dev")
+        claim = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="PR up", reviewer="reviewer",
+            expected_run_id=claim.current_run_id,
+        )
+        kb.add_comment(conn, tid, author="operator",
+                       body="CHANGES REQUESTED: see https://github.com/example/repo/pull/77")
+        assert kb.reopen_review_task(conn, tid) is True
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_describe_suppression_names_guarded_task_ids() -> None:
+    """The stuck-dispatcher warn must name the guarded cards, not just count
+    them. t_b13a4839: the ready queue sat non-empty for 1000+ ticks while the
+    suppression line showed only ``active_pr=6`` — the operator could not see
+    WHICH cards were held, so the deadlock was invisible until a worker
+    comment reconstructed it."""
+    res = kbd.DispatchResult(
+        respawn_guarded=[("t_aaaaaaaaaaaaaaaa", "active_pr"),
+                         ("t_bbbbbbbbbbbbbbbb", "blocker_auth")],
+    )
+    held = kbd.describe_suppression([res])
+    assert "t_aaaaaaaaaaaaaaaa" in held
+    assert "t_bbbbbbbbbbbbbbbb" in held
+
+
 def test_active_pr_guard_lifts_for_implementer_after_changes_requested(
     kanban_home: Path,
 ) -> None:
