@@ -359,6 +359,62 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+_FULL_CLONE_MAX_DEPTH = 2
+
+
+def _dir_size_mb(path: Path) -> int:
+    total = 0
+    for base, _dirs, files in os.walk(path, onerror=lambda *_: None):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(base, name)).st_size
+    return total // (1024 * 1024)
+
+
+def _flag_full_clone_in_workspace(
+    conn: sqlite3.Connection, task_id: str, workspace_path: str
+) -> None:
+    """Record a ``workspace_full_clone`` event + card comment when the task
+    workspace holds full git clones (t_bdc80dd8).
+
+    Repo-bound cards get a managed worktree; a nested ``git clone`` — a
+    ``.git`` DIRECTORY whose clone root sits at most ``_FULL_CLONE_MAX_DEPTH``
+    directories below the workspace root — defeats that lifecycle (gigabytes
+    per card, stale bases, worktrees of worktrees). A linked worktree's
+    ``.git`` FILE is the managed shape and is never flagged. Loud, never
+    fatal: the caller's best-effort guard swallows any failure.
+    """
+    root = Path(workspace_path)
+    if not root.is_dir():
+        return
+    candidates = [root / ".git"]
+    for depth in range(1, _FULL_CLONE_MAX_DEPTH + 1):
+        candidates.extend(root.glob("/".join(["*"] * depth) + "/.git"))
+    clones = [
+        (dot_git.parent, _dir_size_mb(dot_git.parent))
+        for dot_git in candidates
+        if dot_git.is_dir()  # .git FILE (worktree pointer) or absent: not a clone
+    ]
+    if not clones:
+        return
+    _kb._log.warning(
+        "Task %s workspace %s contains %d full git clone(s)",
+        task_id, root, len(clones),
+    )
+    for clone_root, size_mb in clones:
+        _kb._append_event(
+            conn, task_id, "workspace_full_clone",
+            {"path": str(clone_root), "size_mb": size_mb},
+        )
+    listing = "\n".join(f"- {p} ({mb} MB)" for p, mb in clones)
+    _kb.add_comment(
+        conn, task_id, "hermes",
+        "workspace_full_clone: this task's workspace holds full git clone(s). "
+        "Repo-bound cards should work in the card's managed worktree; nested "
+        f"clones waste disk and go stale fast:\n{listing}",
+    )
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -371,6 +427,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if path:
+            # Loud before anything is removed: nested full clones are flagged
+            # for every workspace kind, including the preserved ``dir`` ones.
+            _flag_full_clone_in_workspace(conn, task_id, path)
         if kind not in _REMOVABLE_KINDS or not path:
             # Not removable itself, but completing may still unblock a deferred
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
