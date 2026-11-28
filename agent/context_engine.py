@@ -10,11 +10,15 @@ should_compress() / compress() -> on_session_end() at real session boundaries on
 
 import copy
 import json
+import logging
+from contextlib import suppress
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 
 from agent.compression_marker import elide_middle
 from agent.redact import redact_sensitive_text
+
+logger = logging.getLogger(__name__)
 
 
 MEMORY_CONTEXT_MAX_CHARS = 6_000
@@ -264,3 +268,114 @@ class ContextEngine(ABC):
             model, getattr(self, "model_thresholds", {}), self._config_threshold_percent, provider)
         self.threshold_percent = self._base_threshold_percent
         self.threshold_tokens = int(context_length * self.threshold_percent)
+
+
+class ContextEngineNotFound(RuntimeError):
+    """Raised at session start when ``context.engine`` names an engine that no plugin
+    provides, even after a forced plugin rescan.
+
+    A configured engine that is absent is a config/runtime contradiction, not a warning:
+    silently compressing every conversation on the profile with the built-in compressor
+    is a fleet-scale degradation (2026-11-28: profiles pinned to ``lcm-x`` ran the
+    built-in compressor while the plugin was installed+enabled, because the multiplex
+    gateway's per-profile plugin registry was frozen at process start)."""
+
+
+def lookup_context_engine_by_name(engine_name):
+    """Resolve one configured engine by name. Returns ``(engine, copy_failed)``.
+
+    Leg 1: ``$HERMES_HOME/plugins/context_engine/<name>/`` — a context-engine plugin
+    dropped into the user's plugins dir, selected by name, no ``plugins.enabled`` entry
+    needed (#61839). Leg 2: the engine a plugin registered via
+    ``ctx.register_context_engine()`` — one shared instance, so each agent gets its own
+    via ``clone_for_agent()`` (#42449). ``copy_failed`` marks an engine that EXISTS but
+    could not be copied — the documented built-in-compressor fallback, never the
+    not-found path.
+    """
+    try:
+        from plugins.context_engine import load_context_engine
+        selected = load_context_engine(engine_name)
+    except Exception:  # health: allow BLE001 -- a broken third-party engine loader is a miss, not a crash
+        logger.debug("Context engine load from plugins/context_engine/ failed", exc_info=True)
+        selected = None
+    if selected is not None:
+        return selected, False
+    try:
+        from hermes_cli.plugins import get_plugin_context_engine
+        candidate = get_plugin_context_engine()
+    except Exception:  # health: allow BLE001 -- plugin system unavailable is a miss, not a crash
+        logger.debug("Plugin context engine lookup failed", exc_info=True)
+        candidate = None
+    if candidate is None or candidate.name != engine_name:
+        return None, False
+    # The plugin system holds ONE shared instance; each agent gets its own so a child's
+    # update_model() can't mutate the parent's (#42449). clone_for_agent() defaults to
+    # deepcopy; engines with uncopyable state (locks, DB conns) override it. A failure
+    # falls back to the built-in compressor with an ACCURATE message, not "not found".
+    try:
+        return candidate.clone_for_agent(), False
+    except Exception as copy_err:  # health: allow BLE001 -- documented #42449 fallback contract
+        logger.warning(
+            "Context engine '%s' could not be safely copied for this "
+            "agent (%s) — falling back to built-in compressor. Plugin "
+            "engines that hold uncopyable state (locks, DB connections) "
+            "should override clone_for_agent() (or __deepcopy__) to copy "
+            "only mutable budget state.",
+            engine_name, copy_err,
+        )
+        return None, True
+
+
+def refresh_plugins_and_retry_engine(engine_name):
+    """One forced plugin rescan + lookup retry, for long-lived processes.
+
+    A multiplex gateway resolves plugin discovery once per profile home
+    (``PluginManager._discovered``); an engine plugin enabled — or ``context.engine``
+    selected — AFTER that first scan stays invisible to every later session on the
+    profile, even though a fresh process binds it. Session init is the refresh point:
+    the forced scan re-reads the profile's ``plugins.enabled`` and re-runs plugin
+    registration, so an enable takes effect without a gateway restart. A healthy
+    profile (engine already bound) never reaches here.
+    """
+    try:
+        from hermes_cli.plugins import discover_plugins
+        discover_plugins(force=True)
+    except Exception:  # health: allow BLE001 -- a broken rescan must still reach the retry and the error path
+        logger.warning("Forced plugin rescan while resolving context engine '%s' failed",
+                       engine_name, exc_info=True)
+    return lookup_context_engine_by_name(engine_name)
+
+
+def select_context_engine(agent_cfg):
+    """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
+    general plugin system → None (built-in ContextCompressor).
+
+    A configured engine that no plugin provides is retried once through a forced plugin
+    rescan (:func:`refresh_plugins_and_retry_engine`) and then raises
+    :class:`ContextEngineNotFound` — session start fails loud, naming the engine and the
+    profile, instead of silently degrading every conversation on it to the built-in
+    compressor."""
+    from agent.safe_worker_policy import safe_worker_enabled
+
+    if safe_worker_enabled():
+        return None
+    engine_name = "compressor"
+    with suppress(Exception):
+        ctx_cfg = agent_cfg.get("context", {}) if isinstance(agent_cfg, dict) else {}
+        engine_name = ctx_cfg.get("engine", "compressor") or "compressor"
+    if engine_name == "compressor":
+        return None  # built-in; don't auto-activate plugins
+    selected, copy_failed = lookup_context_engine_by_name(engine_name)
+    if selected is None and not copy_failed:
+        selected, copy_failed = refresh_plugins_and_retry_engine(engine_name)
+    if selected is None and not copy_failed:
+        # A copy failure already warned with the accurate reason (#42449 contract:
+        # built-in fallback, never a raise). Only a genuinely missing engine fails loud.
+        from hermes_constants import get_hermes_home
+        raise ContextEngineNotFound(
+            f"Configured context engine '{engine_name}' was not found in this profile "
+            f"({get_hermes_home()}) even after a forced plugin rescan. Install or enable "
+            "a plugin that registers an engine with this exact name (`hermes plugins "
+            "list`), or set context.engine back to 'compressor'. Failing session start "
+            "rather than silently compressing with the built-in compressor.")
+    return selected

@@ -201,11 +201,17 @@ def test_safe_worker_bypasses_rule_readers_even_without_cli_flags(tmp_path, mode
         from types import SimpleNamespace
         agent = SimpleNamespace(enabled_toolsets=["memory"], disabled_toolsets=[])
         _init_memory(agent, {"memory": {"memory_enabled": True, "user_profile_enabled": True}}, False, "cli")
-        # Explicit custom-engine selection must not escape the process policy.
+        # Explicit custom-engine selection must not escape process policy. A configured
+        # engine that no plugin provides now fails loud at session start
+        # (ContextEngineNotFound, card t_35e7655d); the probe records whether leg-1
+        # discovery ran under the policy, so tolerate the raise after the append.
         import plugins.context_engine
         engines = []
         plugins.context_engine.load_context_engine = lambda name: engines.append(name)
-        _select_context_engine({"context": {"engine": "sentinel"}})
+        try:
+            _select_context_engine({"context": {"engine": "sentinel"}})
+        except Exception:
+            pass
         print(json.dumps({"context": context, "soul": soul, "skills": skills,
             "preloaded": preloaded, "hints": hints, "reads": reads, "engines": engines,
             "memory": agent._memory_store is not None}))
@@ -218,7 +224,10 @@ def test_safe_worker_bypasses_rule_readers_even_without_cli_flags(tmp_path, mode
         assert "SKILL_SENTINEL" in result["skills"] and "SKILL_SENTINEL" in result["preloaded"][0]
         assert "SUB_SENTINEL" in result["hints"]
         assert {"AGENTS.md", "SOUL.md", "SKILL.md", "MEMORY.md"} <= set(result["reads"])
-        assert result["engines"] == ["sentinel"] and result["memory"]
+        # Initial lookup + exactly ONE forced-rescan retry (card t_35e7655d: a missing
+        # engine gets one refresh pass, then ContextEngineNotFound — swallowed by the
+        # probe; what the policy asserts is that leg-1 discovery ran under this policy).
+        assert result["engines"] == ["sentinel", "sentinel"] and result["memory"]
 
 
 @pytest.mark.parametrize("mode", ["safe", "config", "ordinary"])
