@@ -1732,56 +1732,10 @@ def _resolve_context_length(agent, _agent_cfg, base_url):
     return _config_context_length, _custom_providers, _effective_context_length, _model_cfg
 
 
-def _select_context_engine(_agent_cfg):
-    """Config-driven context engine: ``context.engine`` → plugins/context_engine/<name>/ →
-    general plugin system → None (built-in ContextCompressor)."""
-    from agent.safe_worker_policy import safe_worker_enabled
-
-    if safe_worker_enabled():
-        return None
-    _engine_name = "compressor"
-    with suppress(Exception):
-        _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
-        _engine_name = _ctx_cfg.get("engine", "compressor") or "compressor"
-    if _engine_name == "compressor":
-        return None  # built-in; don't auto-activate plugins
-    _selected_engine = None
-    _copy_failed = False
-    try:
-        from plugins.context_engine import load_context_engine
-        _selected_engine = load_context_engine(_engine_name)
-    except Exception as _ce_load_err:
-        _ra().logger.debug("Context engine load from plugins/context_engine/: %s", _ce_load_err)
-
-    if _selected_engine is None:
-        try:
-            from hermes_cli.plugins import get_plugin_context_engine
-            _candidate = get_plugin_context_engine()
-        except Exception:
-            _candidate = None
-        if _candidate is not None and _candidate.name == _engine_name:
-            # The plugin system holds ONE shared instance; each agent gets its own so a child's
-            # update_model() can't mutate the parent's (#42449). clone_for_agent() defaults to
-            # deepcopy; engines with uncopyable state (locks, DB conns) override it. A failure
-            # falls back to the built-in compressor with an ACCURATE message, not "not found".
-            try:
-                _selected_engine = _candidate.clone_for_agent()
-            except Exception as _copy_err:
-                _copy_failed = True
-                _ra().logger.warning(
-                    "Context engine '%s' could not be safely copied for this "
-                    "agent (%s) — falling back to built-in compressor. Plugin "
-                    "engines that hold uncopyable state (locks, DB connections) "
-                    "should override clone_for_agent() (or __deepcopy__) to copy "
-                    "only mutable budget state.",
-                    _engine_name, _copy_err,
-                )
-
-    if _selected_engine is None and not _copy_failed:
-        _ra().logger.warning(
-            "Context engine '%s' not found — falling back to built-in compressor", _engine_name
-        )
-    return _selected_engine
+from agent.context_engine import (
+    ContextEngineNotFound,
+    select_context_engine as _select_context_engine,
+)
 
 
 def _compressor_max_tokens(agent):
