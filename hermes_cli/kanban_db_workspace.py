@@ -686,6 +686,35 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+_WORKTREE_BASE_FETCH_TIMEOUT = 20
+
+
+def _worktree_base_ref(repo_root: Path) -> str:
+    """Ref a brand-new card branch is cut from: ``origin/main`` (fetched,
+    bounded), local ``main``, or raise — never the clone's drifting ``HEAD``.
+
+    The canonical clone's ``HEAD`` is routinely a stale feature branch
+    (observed 5754 commits behind on the fleet's hermes-agent clone); cutting
+    from it rode that history into every card branch (t_bdc80dd8). An offline
+    fetch or a missing origin is not fatal — the ref probe below decides —
+    but with no ``main`` anywhere we fail loudly instead of guessing.
+    """
+    try:
+        _git(repo_root, "fetch", "--quiet", "origin", "main",
+             timeout=_WORKTREE_BASE_FETCH_TIMEOUT)
+    except Exception:
+        pass  # offline / no origin remote: fall through to the local probes
+    for ref in ("refs/remotes/origin/main", "refs/heads/main"):
+        probe = _git(repo_root, "rev-parse", "--verify", "--quiet", ref, timeout=15)
+        if probe.returncode == 0:
+            return ref
+    head = _git(repo_root, "rev-parse", "--short", "HEAD", timeout=15).stdout.strip()
+    raise RuntimeError(
+        f"cannot base a new card branch in {repo_root}: neither origin/main "
+        f"nor local main exists; refusing to cut from HEAD ({head or 'unborn'})"
+    )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -696,7 +725,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        # New card branch: start from the reviewed mainline, not this clone's
+        # HEAD, which is often a stale feature branch (t_bdc80dd8).
+        base = _worktree_base_ref(repo_root)
+        args = ["worktree", "add", "-b", branch_name, str(target), base]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
