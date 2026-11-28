@@ -13,6 +13,7 @@ Hermes' own location before the dispatcher adds the claim.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Mapping
 
@@ -64,3 +65,23 @@ def worker_client_env(env: Mapping[str, str], assignee_home: str | Path) -> dict
     # credential is not part of it: the assignee resolves its own and fails closed without it.
     names = _HOST_NAMES | {name.upper() for name in deployment_env_names()}
     return {k: v for k, v in host.items() if k.upper() in names or k.upper().startswith(_HOST_PREFIXES)}
+
+
+def worker_client_argv() -> list[str]:
+    """The worker client's argv: ``python -P -m hermes_cli.kanban_worker_client``.
+
+    ``-P`` (safe path) is load-bearing, and it belongs beside the env this module hands the
+    client rather than at the spawn site: a bare ``-m`` prepends the child's cwd -- the task
+    workspace -- ahead of the PYTHONPATH pin the dispatcher applies last
+    (``cron.scheduler_worker_env.pin_hermes_tree_on_pythonpath``), and a ``worktree``
+    workspace of the Hermes checkout is a full copy of this source tree, so it outranked the
+    pin. The child then booted the WORKTREE's ``hermes_bootstrap``: a fresh project root
+    whose install has no committed dependency environment, so a PM store interpreter died at
+    ``pm/environments.py::_require_own_dependencies`` before the claim was ever submitted --
+    every dispatcher worktree spawn crashed at bootstrap with zero worker turns. With ``-P``
+    the pin is the whole import contract, the same guarantee
+    ``hermes_bootstrap.harden_import_path`` gives the modules that follow it.
+
+    Regression: tests/hermes_cli/test_kanban_worker_workspace_shadow.py.
+    """
+    return [sys.executable, "-P", "-m", "hermes_cli.kanban_worker_client"]
