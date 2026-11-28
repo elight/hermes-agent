@@ -428,9 +428,9 @@ KANBAN_CREATE_SCHEMA = _schema(
             "type": "string",
             "enum": ["scratch", "dir", "worktree"],
             "description": (
-                "Workspace flavor: 'scratch' (fresh tmp dir, "
-                "default), 'dir' (shared directory, requires "
-                "absolute workspace_path), 'worktree' (git worktree)."
+                "Workspace flavor: 'scratch' (fresh tmp dir, default), "
+                "'dir' (shared absolute workspace_path), 'worktree' (git "
+                "worktree). Repo-bound boards default tasks to a worktree."
             ),
         },
         "workspace_path": _prop("string", (
