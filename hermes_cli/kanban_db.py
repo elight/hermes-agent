@@ -1030,7 +1030,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
 def _resolve_project_link(
     conn: sqlite3.Connection, project_id: Optional[str], project_source_task_id: Optional[str],
-    workspace_kind: str, workspace_path: Optional[str],
+    workspace_kind: str, workspace_path: Optional[str], board: str = "?",
 ) -> tuple[Optional[str], Any, Optional[str], str]:
     """``(project_id, project_obj, project_repo, workspace_kind)`` for ``create_task``.
 
@@ -1058,9 +1058,19 @@ def _resolve_project_link(
         if project_obj is not None and workspace_kind == "scratch":
             workspace_kind = "worktree"
     if project_obj is None:
-        # Unresolvable id/slug: drop the link (never a dangling reference,
-        # never a crash) and create an ordinary scratch task.
-        return None, None, None, workspace_kind
+        raise ValueError(
+            f"project '{project_id}' does not resolve for board '{board}': no "
+            "such id/slug in this profile's projects.db (and no usable "
+            "project_source_task_id). Refusing to degrade silently to an "
+            "unlinked scratch task — fix the reference, or request no project "
+            "(project_id='' / workspace_kind='scratch')."
+        )
+    if project_obj.primary_path is None and project_repo is None:
+        raise ValueError(
+            f"project '{project_obj.slug}' ({project_obj.id}) on board "
+            f"'{board}' has no primary repo path to anchor the task; give the "
+            "project a folder or request no project (project_id='')."
+        )
     # Canonicalise (a slug may have been passed) and anchor the worktree
     # under the project's primary repo.
     if workspace_kind == "scratch" and project_obj.primary_path:
@@ -1183,6 +1193,7 @@ def create_task(
     in the active profile's projects.db — see ``_resolve_project_link``.
     ``workspace_kind=None`` (omitted) inherits a project-scoped board's project;
     an explicit ``"scratch"`` or ``project_id=""`` is a request for no project.
+    A supplied or inherited project that cannot resolve raises ``ValueError``.
     """
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
@@ -1217,7 +1228,8 @@ def create_task(
         raise ValueError("branch_name is only valid for worktree workspaces")
 
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
-        conn, project_id, project_source_task_id, workspace_kind, workspace_path
+        conn, project_id, project_source_task_id, workspace_kind, workspace_path,
+        board=board or get_current_board(),
     )
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)

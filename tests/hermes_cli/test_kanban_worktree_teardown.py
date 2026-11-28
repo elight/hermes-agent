@@ -55,9 +55,12 @@ def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 def repo(tmp_path: Path) -> Path:
     """A project repo with a remote whose history is fully pushed."""
     origin = tmp_path / "origin.git"
-    _git("init", "--bare", str(origin))
+    _git("init", "--bare", "-b", "main", str(origin))
     project = tmp_path / "project"
     _git("clone", str(origin), str(project))
+    # Card branches base on main (t_bdc80dd8): pin the checkout's branch
+    # explicitly instead of trusting the clone-time default.
+    _git("-C", str(project), "checkout", "-B", "main")
     _git("-C", str(project), "config", "user.email", "t@example.com")
     _git("-C", str(project), "config", "user.name", "t")
     (project / "README.md").write_text("hello\n", encoding="utf-8")

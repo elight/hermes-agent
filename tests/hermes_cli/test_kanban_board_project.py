@@ -107,3 +107,59 @@ def test_create_task_explicit_scratch_beats_board(fresh_home, tmp_path):
         assert (default.workspace_kind, default.project_id) == ("worktree", proj_id)
     finally:
         conn.close()
+
+
+def test_create_task_unresolvable_explicit_project_raises(fresh_home):
+    """A supplied project id/slug that does not resolve must raise, naming the
+    project — never silently degrade to an unlinked scratch task."""
+    conn = kbc.connect(board="default")
+    try:
+        with pytest.raises(ValueError, match="ghost-project"):
+            kb.create_task(conn, title="dangling link", project_id="ghost-project")
+    finally:
+        conn.close()
+
+
+def test_create_task_unresolvable_board_project_raises(fresh_home):
+    """board.json project_id pointing at a deleted/foreign project raises too,
+    and the error names both the project and the board."""
+    kb.create_board("ghostboard", name="Ghost Board", project_id="ghost-proj")
+    conn = kbc.connect(board="ghostboard")
+    try:
+        with pytest.raises(ValueError) as excinfo:
+            kb.create_task(conn, title="inherits a ghost", board="ghostboard")
+        message = str(excinfo.value)
+        assert "ghost-proj" in message
+        assert "ghostboard" in message
+    finally:
+        conn.close()
+
+
+def test_create_task_project_without_primary_path_raises(fresh_home):
+    """A project that resolves but owns no repo path cannot anchor a task."""
+    with pdb.connect_closing() as pconn:
+        proj_id = pdb.create_project(pconn, name="NoRepo")  # no folders at all
+
+    conn = kbc.connect(board="default")
+    try:
+        with pytest.raises(ValueError, match=proj_id):
+            kb.create_task(conn, title="anchorless", project_id=proj_id)
+    finally:
+        conn.close()
+
+
+def test_no_project_requests_stay_valid_on_a_broken_board(fresh_home):
+    """The fail-loud rule must not break the deliberate no-project request:
+    explicit scratch and project_id="" both still create on a ghost-scoped
+    board (#106342 parity)."""
+    kb.create_board("ghostboard2", name="Ghost 2", project_id="ghost-proj")
+    conn = kbc.connect(board="ghostboard2")
+    try:
+        scratch = kb.get_task(conn, kb.create_task(
+            conn, title="explicit scratch", board="ghostboard2", workspace_kind="scratch"))
+        assert (scratch.workspace_kind, scratch.project_id) == ("scratch", None)
+        blank = kb.get_task(conn, kb.create_task(
+            conn, title="no project", board="ghostboard2", project_id=""))
+        assert (blank.workspace_kind, blank.project_id) == ("scratch", None)
+    finally:
+        conn.close()

@@ -93,7 +93,7 @@ def _make_malicious_repo(tmp: Path) -> tuple[Path, Path]:
     attribute-scoped external-diff + textconv driver. Returns (repo, marker_stem):
     a fired sink leaves ``<marker_stem>.<sink>`` on disk."""
     repo = tmp / "poc"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=_CLEAN_GIT_ENV)
     (repo / "README").write_text("hi\n")
     ident = ["-c", "user.email=a@b", "-c", "user.name=a"]
     subprocess.run(["git", "-C", str(repo), *ident, "add", "."], check=True, env=_CLEAN_GIT_ENV)
@@ -239,7 +239,7 @@ def test_index_reading_probes_and_kanban_gc_git_are_safe(malicious_repo, tmp_pat
 def _make_filter_repo(tmp: Path, attrs: str, config, marker: str) -> Path:
     """Committed repo whose ``.gitattributes`` is *attrs*; ``config(repo, marker)`` is appended to ``.git/config``."""
     repo = tmp / "repo"
-    subprocess.run(["git", "init", "-q", str(repo)], check=True, env=_CLEAN_GIT_ENV)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True, env=_CLEAN_GIT_ENV)
     (repo / "README").write_text("hi\n")
     (repo / ".gitattributes").write_text(attrs)
     ident = ["-c", "user.email=a@b", "-c", "user.name=a"]

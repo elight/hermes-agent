@@ -359,6 +359,62 @@ def _is_managed_scratch_path(p: Path) -> bool:
     return _managed_scratch_path_info(p)[0]
 
 
+_FULL_CLONE_MAX_DEPTH = 2
+
+
+def _dir_size_mb(path: Path) -> int:
+    total = 0
+    for base, _dirs, files in os.walk(path, onerror=lambda *_: None):
+        for name in files:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(base, name)).st_size
+    return total // (1024 * 1024)
+
+
+def _flag_full_clone_in_workspace(
+    conn: sqlite3.Connection, task_id: str, workspace_path: str
+) -> None:
+    """Record a ``workspace_full_clone`` event + card comment when the task
+    workspace holds full git clones (t_bdc80dd8).
+
+    Repo-bound cards get a managed worktree; a nested ``git clone`` — a
+    ``.git`` DIRECTORY whose clone root sits at most ``_FULL_CLONE_MAX_DEPTH``
+    directories below the workspace root — defeats that lifecycle (gigabytes
+    per card, stale bases, worktrees of worktrees). A linked worktree's
+    ``.git`` FILE is the managed shape and is never flagged. Loud, never
+    fatal: the caller's best-effort guard swallows any failure.
+    """
+    root = Path(workspace_path)
+    if not root.is_dir():
+        return
+    candidates = [root / ".git"]
+    for depth in range(1, _FULL_CLONE_MAX_DEPTH + 1):
+        candidates.extend(root.glob("/".join(["*"] * depth) + "/.git"))
+    clones = [
+        (dot_git.parent, _dir_size_mb(dot_git.parent))
+        for dot_git in candidates
+        if dot_git.is_dir()  # .git FILE (worktree pointer) or absent: not a clone
+    ]
+    if not clones:
+        return
+    _kb._log.warning(
+        "Task %s workspace %s contains %d full git clone(s)",
+        task_id, root, len(clones),
+    )
+    for clone_root, size_mb in clones:
+        _kb._append_event(
+            conn, task_id, "workspace_full_clone",
+            {"path": str(clone_root), "size_mb": size_mb},
+        )
+    listing = "\n".join(f"- {p} ({mb} MB)" for p, mb in clones)
+    _kb.add_comment(
+        conn, task_id, "hermes",
+        "workspace_full_clone: this task's workspace holds full git clone(s). "
+        "Repo-bound cards should work in the card's managed worktree; nested "
+        f"clones waste disk and go stale fast:\n{listing}",
+    )
+
+
 def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
     """Remove a task's scratch workspace dir and kill its stale tmux session.
     Called from :func:`complete_task` after the transaction commits; best-effort
@@ -371,6 +427,10 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             return
         kind: Optional[str] = row["workspace_kind"]
         path: Optional[str] = row["workspace_path"]
+        if path:
+            # Loud before anything is removed: nested full clones are flagged
+            # for every workspace kind, including the preserved ``dir`` ones.
+            _flag_full_clone_in_workspace(conn, task_id, path)
         if kind not in _REMOVABLE_KINDS or not path:
             # Not removable itself, but completing may still unblock a deferred
             # parent scratch cleanup (e.g. a 'dir' child of a scratch parent).
@@ -686,6 +746,35 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+_WORKTREE_BASE_FETCH_TIMEOUT = 20
+
+
+def _worktree_base_ref(repo_root: Path) -> str:
+    """Ref a brand-new card branch is cut from: ``origin/main`` (fetched,
+    bounded), local ``main``, or raise — never the clone's drifting ``HEAD``.
+
+    The canonical clone's ``HEAD`` is routinely a stale feature branch
+    (observed 5754 commits behind on the fleet's hermes-agent clone); cutting
+    from it rode that history into every card branch (t_bdc80dd8). An offline
+    fetch or a missing origin is not fatal — the ref probe below decides —
+    but with no ``main`` anywhere we fail loudly instead of guessing.
+    """
+    try:
+        _git(repo_root, "fetch", "--quiet", "origin", "main",
+             timeout=_WORKTREE_BASE_FETCH_TIMEOUT)
+    except Exception:
+        pass  # offline / no origin remote: fall through to the local probes
+    for ref in ("refs/remotes/origin/main", "refs/heads/main"):
+        probe = _git(repo_root, "rev-parse", "--verify", "--quiet", ref, timeout=15)
+        if probe.returncode == 0:
+            return ref
+    head = _git(repo_root, "rev-parse", "--short", "HEAD", timeout=15).stdout.strip()
+    raise RuntimeError(
+        f"cannot base a new card branch in {repo_root}: neither origin/main "
+        f"nor local main exists; refusing to cut from HEAD ({head or 'unborn'})"
+    )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -696,7 +785,10 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        # New card branch: start from the reviewed mainline, not this clone's
+        # HEAD, which is often a stale feature branch (t_bdc80dd8).
+        base = _worktree_base_ref(repo_root)
+        args = ["worktree", "add", "-b", branch_name, str(target), base]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
